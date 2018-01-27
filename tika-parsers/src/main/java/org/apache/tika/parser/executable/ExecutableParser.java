@@ -65,7 +65,7 @@ public class ExecutableParser extends AbstractParser implements MachineMetadata 
             throws IOException, SAXException, TikaException {
         // We only do metadata, for now
         XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
-
+        xhtml.startDocument();
         // What kind is it?
         byte[] first4 = new byte[4];
         IOUtils.readFully(stream, first4);
@@ -87,7 +87,7 @@ public class ExecutableParser extends AbstractParser implements MachineMetadata 
      */
     public void parsePE(XHTMLContentHandler xhtml, Metadata metadata,
           InputStream stream, byte[] first4) throws TikaException, IOException {
-       metadata.add(Metadata.CONTENT_TYPE, PE_EXE.toString());
+       metadata.set(Metadata.CONTENT_TYPE, PE_EXE.toString());
        metadata.set(PLATFORM, PLATFORM_WINDOWS);
        
        // Skip over the MS-DOS bit
@@ -321,23 +321,23 @@ public class ExecutableParser extends AbstractParser implements MachineMetadata 
        }
        switch(type) {
          case 1:
-            metadata.add(Metadata.CONTENT_TYPE, ELF_OBJECT.toString());
+            metadata.set(Metadata.CONTENT_TYPE, ELF_OBJECT.toString());
             break;
             
          case 2:
-            metadata.add(Metadata.CONTENT_TYPE, ELF_EXECUTABLE.toString());
+            metadata.set(Metadata.CONTENT_TYPE, ELF_EXECUTABLE.toString());
             break;
             
          case 3:
-            metadata.add(Metadata.CONTENT_TYPE, ELF_SHAREDLIB.toString());
+            metadata.set(Metadata.CONTENT_TYPE, ELF_SHAREDLIB.toString());
             break;
             
          case 4:
-            metadata.add(Metadata.CONTENT_TYPE, ELF_COREDUMP.toString());
+            metadata.set(Metadata.CONTENT_TYPE, ELF_COREDUMP.toString());
             break;
             
          default:
-            metadata.add(Metadata.CONTENT_TYPE, ELF_GENERAL.toString());
+            metadata.set(Metadata.CONTENT_TYPE, ELF_GENERAL.toString());
             break;
        }
                  

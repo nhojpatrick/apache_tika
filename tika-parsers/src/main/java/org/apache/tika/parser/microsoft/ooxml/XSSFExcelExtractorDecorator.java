@@ -16,15 +16,17 @@
  */
 package org.apache.tika.parser.microsoft.ooxml;
 
-import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.parsers.SAXParser;
-import javax.xml.parsers.SAXParserFactory;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
+import org.apache.poi.POIXMLDocument;
+import org.apache.poi.POIXMLTextExtractor;
 import org.apache.poi.hssf.extractor.ExcelExtractor;
 import org.apache.poi.openxml4j.exceptions.InvalidFormatException;
 import org.apache.poi.openxml4j.exceptions.OpenXML4JException;
@@ -32,6 +34,7 @@ import org.apache.poi.openxml4j.opc.OPCPackage;
 import org.apache.poi.openxml4j.opc.PackagePart;
 import org.apache.poi.openxml4j.opc.PackagePartName;
 import org.apache.poi.openxml4j.opc.PackageRelationship;
+import org.apache.poi.openxml4j.opc.PackageRelationshipTypes;
 import org.apache.poi.openxml4j.opc.PackagingURIHelper;
 import org.apache.poi.openxml4j.opc.TargetMode;
 import org.apache.poi.ss.usermodel.DataFormatter;
@@ -44,46 +47,65 @@ import org.apache.poi.xssf.extractor.XSSFEventBasedExcelExtractor;
 import org.apache.poi.xssf.model.CommentsTable;
 import org.apache.poi.xssf.model.StylesTable;
 import org.apache.poi.xssf.usermodel.XSSFComment;
+import org.apache.poi.xssf.usermodel.XSSFDrawing;
 import org.apache.poi.xssf.usermodel.XSSFRelation;
 import org.apache.poi.xssf.usermodel.XSSFShape;
 import org.apache.poi.xssf.usermodel.XSSFSimpleShape;
 import org.apache.poi.xssf.usermodel.helpers.HeaderFooterHelper;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.metadata.TikaMetadataKeys;
 import org.apache.tika.parser.ParseContext;
+import org.apache.tika.parser.microsoft.TikaExcelDataFormatter;
+import org.apache.tika.sax.OfflineContentHandler;
 import org.apache.tika.sax.XHTMLContentHandler;
 import org.apache.xmlbeans.XmlException;
+import org.openxmlformats.schemas.drawingml.x2006.main.CTHyperlink;
+import org.openxmlformats.schemas.drawingml.x2006.main.CTNonVisualDrawingProps;
+import org.openxmlformats.schemas.drawingml.x2006.spreadsheetDrawing.CTShape;
+import org.openxmlformats.schemas.drawingml.x2006.spreadsheetDrawing.CTShapeNonVisual;
 import org.xml.sax.Attributes;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.InputSource;
 import org.xml.sax.Locator;
 import org.xml.sax.SAXException;
 import org.xml.sax.XMLReader;
+import org.xml.sax.helpers.DefaultHandler;
 
 public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
     /**
      * Allows access to headers/footers from raw xml strings
      */
-    private static HeaderFooterHelper hfHelper = new HeaderFooterHelper();
-    private final XSSFEventBasedExcelExtractor extractor;
-    private final DataFormatter formatter;
-    private final List<PackagePart> sheetParts = new ArrayList<PackagePart>();
-    private Metadata metadata;
+    protected static HeaderFooterHelper hfHelper = new HeaderFooterHelper();
+    protected final DataFormatter formatter;
+    protected final List<PackagePart> sheetParts = new ArrayList<PackagePart>();
+    protected final Map<String, String> drawingHyperlinks = new HashMap<>();
+    protected Metadata metadata;
+    protected ParseContext parseContext;
 
     public XSSFExcelExtractorDecorator(
-            ParseContext context, XSSFEventBasedExcelExtractor extractor, Locale locale) {
+            ParseContext context, POIXMLTextExtractor extractor, Locale locale) {
         super(context, extractor);
 
-        this.extractor = extractor;
-        extractor.setFormulasNotResults(false);
-        extractor.setLocale(locale);
+        this.parseContext = context;
+        this.extractor = (XSSFEventBasedExcelExtractor)extractor;
+        configureExtractor(this.extractor, locale);
 
         if (locale == null) {
-            formatter = new DataFormatter();
+            formatter = new TikaExcelDataFormatter();
         } else {
-            formatter = new DataFormatter(locale);
+            formatter = new TikaExcelDataFormatter(locale);
         }
+    }
+
+    protected void configureExtractor(POIXMLTextExtractor extractor, Locale locale) {
+        ((XSSFEventBasedExcelExtractor)extractor).setIncludeTextBoxes(config.getIncludeShapeBasedContent());
+        ((XSSFEventBasedExcelExtractor)extractor).setFormulasNotResults(false);
+        ((XSSFEventBasedExcelExtractor)extractor).setLocale(locale);
+        //given that we load our own shared strings table, setting:
+        //((XSSFEventBasedExcelExtractor)extractor).setConcatenatePhoneticRuns();
+        //does no good here.
     }
 
     @Override
@@ -92,6 +114,7 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
             throws SAXException, XmlException, IOException, TikaException {
 
         this.metadata = metadata;
+        this.parseContext = context;
         metadata.set(TikaMetadataKeys.PROTECTED, "false");
 
         super.getXHTML(handler, metadata, context);
@@ -112,8 +135,9 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
         try {
             xssfReader = new XSSFReader(container);
             styles = xssfReader.getStylesTable();
+
             iter = (XSSFReader.SheetIterator) xssfReader.getSheetsData();
-            strings = new ReadOnlySharedStringsTable(container);
+            strings = new ReadOnlySharedStringsTable(container, config.getConcatenatePhoneticRuns());
         } catch (InvalidFormatException e) {
             throw new XmlException(e);
         } catch (OpenXML4JException oe) {
@@ -121,22 +145,27 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
         }
 
         while (iter.hasNext()) {
-            InputStream stream = iter.next();
-            sheetParts.add(iter.getSheetPart());
 
-            SheetTextAsHTML sheetExtractor = new SheetTextAsHTML(xhtml);
-            CommentsTable comments = iter.getSheetComments();
+            SheetTextAsHTML sheetExtractor = new SheetTextAsHTML(config.getIncludeHeadersAndFooters(), xhtml);
+            PackagePart sheetPart = null;
+            try (InputStream stream = iter.next()) {
+                sheetPart = iter.getSheetPart();
 
-            // Start, and output the sheet name
-            xhtml.startElement("div");
-            xhtml.element("h1", iter.getSheetName());
+                addDrawingHyperLinks(sheetPart);
+                sheetParts.add(sheetPart);
 
-            // Extract the main sheet contents
-            xhtml.startElement("table");
-            xhtml.startElement("tbody");
+                CommentsTable comments = iter.getSheetComments();
 
-            processSheet(sheetExtractor, comments, styles, strings, stream);
+                // Start, and output the sheet name
+                xhtml.startElement("div");
+                xhtml.element("h1", iter.getSheetName());
 
+                // Extract the main sheet contents
+                xhtml.startElement("table");
+                xhtml.startElement("tbody");
+
+                processSheet(sheetExtractor, comments, styles, strings, stream);
+            }
             xhtml.endElement("tbody");
             xhtml.endElement("table");
 
@@ -149,13 +178,70 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
             for (String footer : sheetExtractor.footers) {
                 extractHeaderFooter(footer, xhtml);
             }
-            processShapes(iter.getShapes(), xhtml);
+            
+            // Do text held in shapes, if required
+            if (config.getIncludeShapeBasedContent()) {
+                List<XSSFShape> shapes = iter.getShapes();
+                processShapes(shapes, xhtml);
+            }
+
+            //for now dump sheet hyperlinks at bottom of page
+            //consider a double-pass of the inputstream to reunite hyperlinks with cells/textboxes
+            //step 1: extract hyperlink info from bottom of page
+            //step 2: process as we do now, but with cached hyperlink relationship info
+            extractHyperLinks(sheetPart, xhtml);
             // All done with this sheet
             xhtml.endElement("div");
         }
+
+        //consider adding this back to POI
+        try (InputStream wbData = xssfReader.getWorkbookData()) {
+            SAXParser parser = parseContext.getSAXParser();
+            parser.parse(wbData, new OfflineContentHandler(new AbsPathExtractorHandler()));
+        } catch (InvalidFormatException|TikaException e) {
+            //swallow
+        }
     }
 
-    private void extractHeaderFooter(String hf, XHTMLContentHandler xhtml)
+
+    protected void addDrawingHyperLinks(PackagePart sheetPart) {
+        try {
+            for (PackageRelationship rel : sheetPart.getRelationshipsByType(XSSFRelation.DRAWINGS.getRelation())) {
+                if (rel.getTargetMode() == TargetMode.INTERNAL) {
+                    PackagePartName relName = PackagingURIHelper.createPartName(rel.getTargetURI());
+                    PackagePart part = rel.getPackage().getPart(relName);
+                    //parts can go missing, and Excel quietly ignores missing images -- TIKA-2134
+                    if (part == null) {
+                        continue;
+                    }
+                    for (PackageRelationship drawRel : part
+                            .getRelationshipsByType(XSSFRelation.SHEET_HYPERLINKS.getRelation())) {
+                        drawingHyperlinks.put(drawRel.getId(), drawRel.getTargetURI().toString());
+                    }
+                }
+            }
+        } catch (InvalidFormatException e) {
+            //swallow
+            //an exception trying to extract
+            //hyperlinks on drawings should not cause a parse failure
+        }
+
+    }
+
+
+    private void extractHyperLinks(PackagePart sheetPart, XHTMLContentHandler xhtml) throws SAXException {
+        try {
+            for (PackageRelationship rel : sheetPart.getRelationshipsByType(XSSFRelation.SHEET_HYPERLINKS.getRelation())) {
+                xhtml.startElement("a", "href", rel.getTargetURI().toString());
+                xhtml.characters(rel.getTargetURI().toString());
+                xhtml.endElement("a");
+            }
+        } catch (InvalidFormatException e) {
+            //swallow
+        }
+    }
+
+    protected void extractHeaderFooter(String hf, XHTMLContentHandler xhtml)
             throws SAXException {
         String content = ExcelExtractor._extractHeaderFooter(
                 new HeaderFooterFromString(hf));
@@ -174,8 +260,71 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
                 if (sText != null && sText.length() > 0) {
                     xhtml.element("p", sText);
                 }
+                extractHyperLinksFromShape(((XSSFSimpleShape)shape).getCTShape(), xhtml);
+            }
+            XSSFDrawing drawing = shape.getDrawing();
+            if (drawing != null) {
+                //dump diagram data
+                handleGeneralTextContainingPart(
+                        AbstractOOXMLExtractor.RELATION_DIAGRAM_DATA,
+                        "diagram-data",
+                        drawing.getPackagePart(),
+                        metadata,
+                        new OOXMLWordAndPowerPointTextHandler(
+                                new OOXMLTikaBodyPartHandler(xhtml),
+                                new HashMap<String, String>()//empty
+                        )
+                );
+                //dump chart data
+                handleGeneralTextContainingPart(
+                        XSSFRelation.CHART.getRelation(),
+                        "chart",
+                        drawing.getPackagePart(),
+                        metadata,
+                        new OOXMLWordAndPowerPointTextHandler(
+                                new OOXMLTikaBodyPartHandler(xhtml),
+                                new HashMap<String, String>()//empty
+                        )
+                );
             }
         }
+    }
+
+    private void extractHyperLinksFromShape(CTShape ctShape, XHTMLContentHandler xhtml) throws SAXException {
+
+        if (ctShape == null)
+            return;
+
+        CTShapeNonVisual nvSpPR = ctShape.getNvSpPr();
+        if (nvSpPR == null)
+            return;
+
+        CTNonVisualDrawingProps cNvPr = nvSpPR.getCNvPr();
+        if (cNvPr == null)
+            return;
+
+        CTHyperlink ctHyperlink = cNvPr.getHlinkClick();
+        if (ctHyperlink == null)
+            return;
+
+        String url = drawingHyperlinks.get(ctHyperlink.getId());
+        if (url != null) {
+            xhtml.startElement("a", "href", url);
+            xhtml.characters(url);
+            xhtml.endElement("a");
+        }
+
+        CTHyperlink ctHoverHyperlink = cNvPr.getHlinkHover();
+        if (ctHoverHyperlink == null)
+            return;
+
+        url = drawingHyperlinks.get(ctHoverHyperlink.getId());
+        if (url != null) {
+            xhtml.startElement("a", "href", url);
+            xhtml.characters(url);
+            xhtml.endElement("a");
+        }
+
     }
 
     public void processSheet(
@@ -186,10 +335,8 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
             InputStream sheetInputStream)
             throws IOException, SAXException {
         InputSource sheetSource = new InputSource(sheetInputStream);
-        SAXParserFactory saxFactory = SAXParserFactory.newInstance();
         try {
-            SAXParser saxParser = saxFactory.newSAXParser();
-            XMLReader sheetParser = saxParser.getXMLReader();
+            XMLReader sheetParser = parseContext.getXMLReader();
             XSSFSheetInterestingPartsCapturer handler =
                     new XSSFSheetInterestingPartsCapturer(new XSSFSheetXMLHandler(
                             styles, comments, strings, sheetContentsExtractor, formatter, false));
@@ -200,7 +347,7 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
             if (handler.hasProtection) {
                 metadata.set(TikaMetadataKeys.PROTECTED, "true");
             }
-        } catch (ParserConfigurationException e) {
+        } catch (TikaException e) {
             throw new RuntimeException("SAX parser appears to be broken - " + e.getMessage());
         }
     }
@@ -235,6 +382,13 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
             }
         }
 
+        //add main document so that macros can be extracted
+        //by AbstractOOXMLExtractor
+        for (PackagePart part : extractor.getPackage().
+                getPartsByRelationshipType(PackageRelationshipTypes.CORE_DOCUMENT)) {
+            parts.add(part);
+        }
+
         return parts;
     }
 
@@ -243,10 +397,12 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
      */
     protected static class SheetTextAsHTML implements SheetContentsHandler {
         private XHTMLContentHandler xhtml;
-        private List<String> headers;
-        private List<String> footers;
+        private final boolean includeHeadersFooters;
+        protected List<String> headers;
+        protected List<String> footers;
 
-        protected SheetTextAsHTML(XHTMLContentHandler xhtml) {
+        protected SheetTextAsHTML(boolean includeHeaderFooters, XHTMLContentHandler xhtml) {
+            this.includeHeadersFooters = includeHeaderFooters;
             this.xhtml = xhtml;
             headers = new ArrayList<String>();
             footers = new ArrayList<String>();
@@ -290,6 +446,9 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
         }
 
         public void headerFooter(String text, boolean isHeader, String tagName) {
+            if (! includeHeadersFooters) {
+                return;
+            }
             if (isHeader) {
                 headers.add(text);
             } else {
@@ -390,6 +549,23 @@ public class XSSFExcelExtractorDecorator extends AbstractOOXMLExtractor {
         public void startPrefixMapping(String prefix, String uri)
                 throws SAXException {
             delegate.startPrefixMapping(prefix, uri);
+        }
+    }
+
+    private class AbsPathExtractorHandler extends DefaultHandler {
+        @Override
+        public void startElement(String uri, String localName, String qName, Attributes atts) throws SAXException {
+            //require x15ac //http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac ???
+            if ("absPath".equals(localName)) {
+                for (int i = 0; i < atts.getLength(); i++) {
+                    String n = atts.getLocalName(i);
+                    if ("url".equals(n)) {
+                        String url = atts.getValue(i);
+                        metadata.set(TikaCoreProperties.ORIGINAL_RESOURCE_NAME, url);
+                        return;
+                    }
+                }
+            }
         }
     }
 }

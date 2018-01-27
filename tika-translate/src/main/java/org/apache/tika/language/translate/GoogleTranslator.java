@@ -17,24 +17,23 @@
 
 package org.apache.tika.language.translate;
 
-import javax.ws.rs.core.MediaType;
-import javax.ws.rs.core.Response;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.Properties;
-import java.util.logging.Logger;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+
+import org.apache.cxf.jaxrs.client.WebClient;
+import org.apache.tika.exception.TikaException;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.cxf.jaxrs.client.WebClient;
-import org.apache.tika.exception.TikaException;
-import org.apache.tika.language.LanguageIdentifier;
-import org.apache.tika.language.LanguageProfile;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * An implementation of a REST client to the <a
@@ -46,14 +45,13 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * 
  * 
  */
-public class GoogleTranslator implements Translator {
+public class GoogleTranslator extends AbstractTranslator {
+
+	private static final Logger LOG = LoggerFactory.getLogger(GoogleTranslator.class);
 
 	private static final String GOOGLE_TRANSLATE_URL_BASE = "https://www.googleapis.com/language/translate/v2";
 
 	private static final String DEFAULT_KEY = "dummy-secret";
-
-	private static final Logger LOG = Logger.getLogger(GoogleTranslator.class
-			.getName());
 
 	private WebClient client;
 
@@ -73,7 +71,7 @@ public class GoogleTranslator implements Translator {
 			if (this.apiKey.equals(DEFAULT_KEY))
 				this.isAvailable = false;
 		} catch (Exception e) {
-			e.printStackTrace();
+			LOG.warn("Exception reading config file", e);
 			isAvailable = false;
 		}
 	}
@@ -104,9 +102,8 @@ public class GoogleTranslator implements Translator {
 			throws TikaException, IOException {
 		if (!this.isAvailable)
 			return text;
-		LanguageIdentifier language = new LanguageIdentifier(
-				new LanguageProfile(text));
-		String sourceLanguage = language.getLanguage();
+		
+		String sourceLanguage = detectLanguage(text).getLanguage();
 		return translate(text, sourceLanguage, targetLanguage);
 	}
 

@@ -18,13 +18,12 @@ package org.apache.tika.bundle;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.ops4j.pax.exam.CoreOptions.bundle;
 import static org.ops4j.pax.exam.CoreOptions.junitBundles;
+import static org.ops4j.pax.exam.CoreOptions.mavenBundle;
 import static org.ops4j.pax.exam.CoreOptions.options;
-
-import javax.inject.Inject;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -39,6 +38,8 @@ import java.util.Set;
 import java.util.jar.Attributes;
 import java.util.jar.JarInputStream;
 import java.util.jar.Manifest;
+
+import javax.inject.Inject;
 
 import org.apache.tika.Tika;
 import org.apache.tika.detect.DefaultDetector;
@@ -68,25 +69,28 @@ import org.xml.sax.ContentHandler;
 @RunWith(PaxExam.class)
 @ExamReactorStrategy(PerMethod.class)
 public class BundleIT {
-
-    private final File TARGET = new File("target");
-
+	
+	private final File TARGET = new File("target");
+	
     @Inject
     private Parser defaultParser;
+
     @Inject
     private Detector contentTypeDetector;
+
     @Inject
     private BundleContext bc;
 
     @Configuration
-    public Option[] configuration() throws IOException, URISyntaxException {
-        File base = new File(TARGET, "test-bundles");
+    public Option[] configuration() throws IOException, URISyntaxException, ClassNotFoundException {
+    	File base = new File(TARGET, "test-bundles");
         return options(
-                junitBundles(),
-                bundle(new File(base, "tika-core.jar").toURI().toURL().toString()),
-                bundle(new File(base, "tika-bundle.jar").toURI().toURL().toString()));
+        		bundle(new File(base, "tika-core.jar").toURI().toURL().toString()),
+        		mavenBundle("org.ops4j.pax.logging", "pax-logging-api", "1.8.5"),
+        		mavenBundle("org.ops4j.pax.logging", "pax-logging-service", "1.8.5"),
+        		junitBundles(),
+        		bundle(new File(base, "tika-bundle.jar").toURI().toURL().toString()));
     }
-
 
     @Test
     public void testBundleLoaded() throws Exception {
@@ -104,7 +108,6 @@ public class BundleIT {
         assertTrue("Core bundle not found", hasCore);
         assertTrue("Bundle bundle not found", hasBundle);
     }
-
 
     @Test
     public void testManifestNoJUnit() throws Exception {
@@ -124,12 +127,11 @@ public class BundleIT {
         assertFalse("The bundle should not import junit", containsJunit);
     }
 
-
     @Test
     public void testBundleDetection() throws Exception {
         Metadata metadataTXT = new Metadata();
         metadataTXT.set(Metadata.RESOURCE_NAME_KEY, "test.txt");
-        
+
         Metadata metadataPDF = new Metadata();
         metadataPDF.set(Metadata.RESOURCE_NAME_KEY, "test.pdf");
 
@@ -137,7 +139,6 @@ public class BundleIT {
         assertEquals(MediaType.TEXT_PLAIN, contentTypeDetector.detect(null, metadataTXT));
         assertEquals(MediaType.application("pdf"), contentTypeDetector.detect(null, metadataPDF));
     }
-
 
     @Test
     public void testForkParser() throws Exception {
@@ -158,7 +159,6 @@ public class BundleIT {
         assertEquals("test content", content.trim());
     }
 
-
     @Test
     public void testBundleSimpleText() throws Exception {
         Tika tika = new Tika();
@@ -167,7 +167,6 @@ public class BundleIT {
         String xml = tika.parseToString(new File("pom.xml"));
         assertTrue(xml.contains("tika-bundle"));
     }
-
 
     @Test
     public void testBundleDetectors() throws Exception {
@@ -179,9 +178,9 @@ public class BundleIT {
 
         // Get the classes found within OSGi
         ServiceReference<Detector> detectorRef = bc.getServiceReference(Detector.class);
-        DefaultDetector detectorService = (DefaultDetector)bc.getService(detectorRef);
-        
-        Set<String> osgiDetectors = new HashSet<String>();
+        DefaultDetector detectorService = (DefaultDetector) bc.getService(detectorRef);
+
+        Set<String> osgiDetectors = new HashSet<>();
         for (Detector d : detectorService.getDetectors()) {
             osgiDetectors.add(d.getClass().getName());
         }
@@ -195,7 +194,7 @@ public class BundleIT {
         Set<String> rawDetectors = new HashSet<String>();
         for (Detector d : detector.getDetectors()) {
             if (d instanceof DefaultDetector) {
-                for (Detector dChild : ((DefaultDetector)d).getDetectors()) {
+                for (Detector dChild : ((DefaultDetector) d).getDetectors()) {
                     rawDetectors.add(dChild.getClass().getName());
                 }
             } else {
@@ -205,14 +204,13 @@ public class BundleIT {
         assertEquals(osgiDetectors, rawDetectors);
     }
 
-
     @Test
     public void testBundleParsers() throws Exception {
         // Get the classes found within OSGi
         ServiceReference<Parser> parserRef = bc.getServiceReference(Parser.class);
-        DefaultParser parserService = (DefaultParser)bc.getService(parserRef);
-        
-        Set<String> osgiParsers = new HashSet<String>();
+        DefaultParser parserService = (DefaultParser) bc.getService(parserRef);
+
+        Set<String> osgiParsers = new HashSet<>();
         for (Parser p : parserService.getAllComponentParsers()) {
             osgiParsers.add(p.getClass().getName());
         }
@@ -222,11 +220,11 @@ public class BundleIT {
                 osgiParsers.size() > 15);
 
         // Get the raw parsers list from the traditional service loading mechanism
-        CompositeParser parser = (CompositeParser)defaultParser;
-        Set<String> rawParsers = new HashSet<String>();
+        CompositeParser parser = (CompositeParser) defaultParser;
+        Set<String> rawParsers = new HashSet<>();
         for (Parser p : parser.getAllComponentParsers()) {
             if (p instanceof DefaultParser) {
-                for (Parser pChild : ((DefaultParser)p).getAllComponentParsers()) {
+                for (Parser pChild : ((DefaultParser) p).getAllComponentParsers()) {
                     rawParsers.add(pChild.getClass().getName());
                 }
             } else {
@@ -235,19 +233,17 @@ public class BundleIT {
         }
         assertEquals(rawParsers, osgiParsers);
     }
-    
+
     @Test
     public void testTesseractParser() throws Exception {
         ContentHandler handler = new BodyContentHandler();
         ParseContext context = new ParseContext();
         Parser tesseractParser = new TesseractOCRParser();
-        try(InputStream stream = new FileInputStream("src/test/resources/testOCR.jpg"))
-        {
+        try (InputStream stream = new FileInputStream("src/test/resources/testOCR.jpg")) {
             tesseractParser.parse(stream, handler, new Metadata(), context);
         }
-        
-    }
 
+    }
 
     @Test
     public void testTikaBundle() throws Exception {
@@ -261,7 +257,7 @@ public class BundleIT {
         context.set(Parser.class, parser);
 
         try (InputStream stream =
-                new FileInputStream("src/test/resources/test-documents.zip")) {
+                     new FileInputStream("src/test/resources/test-documents.zip")) {
             parser.parse(stream, handler, new Metadata(), context);
         }
 

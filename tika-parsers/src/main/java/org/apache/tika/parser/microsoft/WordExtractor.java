@@ -16,6 +16,8 @@
  */
 package org.apache.tika.parser.microsoft;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -32,6 +34,8 @@ import org.apache.poi.hwpf.OldWordFileFormatException;
 import org.apache.poi.hwpf.extractor.Word6Extractor;
 import org.apache.poi.hwpf.model.FieldsDocumentPart;
 import org.apache.poi.hwpf.model.PicturesTable;
+import org.apache.poi.hwpf.model.SavedByEntry;
+import org.apache.poi.hwpf.model.SavedByTable;
 import org.apache.poi.hwpf.model.StyleDescription;
 import org.apache.poi.hwpf.usermodel.CharacterRun;
 import org.apache.poi.hwpf.usermodel.Field;
@@ -46,14 +50,15 @@ import org.apache.poi.poifs.filesystem.DirectoryEntry;
 import org.apache.poi.poifs.filesystem.DirectoryNode;
 import org.apache.poi.poifs.filesystem.Entry;
 import org.apache.poi.poifs.filesystem.NPOIFSFileSystem;
+import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.XHTMLContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 public class WordExtractor extends AbstractPOIFSExtractor {
 
@@ -78,9 +83,13 @@ public class WordExtractor extends AbstractPOIFSExtractor {
     private boolean curStrikeThrough;
     private boolean curBold;
     private boolean curItalic;
+    private boolean curUnderline;
 
-    public WordExtractor(ParseContext context) {
+    private final Metadata metadata;
+
+    public WordExtractor(ParseContext context, Metadata metadata) {
         super(context);
+        this.metadata = metadata;
     }
 
     private static int countParagraphs(Range... ranges) {
@@ -98,6 +107,11 @@ public class WordExtractor extends AbstractPOIFSExtractor {
      * what style should be applied to it.
      */
     public static TagAndStyle buildParagraphTagAndStyle(String styleName, boolean isTable) {
+
+        if (styleName == null || styleName.length() < 2) {
+            return defaultParagraphStyle;
+        }
+
         TagAndStyle tagAndStyle = fixedParagraphStyles.get(styleName);
         if (tagAndStyle != null) {
             return tagAndStyle;
@@ -142,25 +156,31 @@ public class WordExtractor extends AbstractPOIFSExtractor {
         HWPFDocument document;
         try {
             document = new HWPFDocument(root);
+        } catch (org.apache.poi.EncryptedDocumentException e) {
+                throw new EncryptedDocumentException(e);
         } catch (OldWordFileFormatException e) {
             parseWord6(root, xhtml);
             return;
         }
+
+        extractSavedByMetadata(document);
+
         org.apache.poi.hwpf.extractor.WordExtractor wordExtractor =
                 new org.apache.poi.hwpf.extractor.WordExtractor(document);
-        HeaderStories headerFooter = new HeaderStories(document);
 
         // Grab the list of pictures. As far as we can tell,
         //  the pictures should be in order, and may be directly
         //  placed or referenced from an anchor
         PicturesTable pictureTable = document.getPicturesTable();
         PicturesSource pictures = new PicturesSource(document);
-
+        HeaderStories headerFooter = null;
         // Do any headers, if present
-        Range[] headers = new Range[]{headerFooter.getFirstHeaderSubrange(),
-                headerFooter.getEvenHeaderSubrange(), headerFooter.getOddHeaderSubrange()};
-        handleHeaderFooter(headers, "header", document, pictures, pictureTable, xhtml);
-
+        if (officeParserConfig.getIncludeHeadersAndFooters()) {
+            headerFooter = new HeaderStories(document);
+            Range[] headers = new Range[]{headerFooter.getFirstHeaderSubrange(),
+                    headerFooter.getEvenHeaderSubrange(), headerFooter.getOddHeaderSubrange()};
+            handleHeaderFooter(headers, "header", document, pictures, pictureTable, xhtml);
+        }
         // Do the main paragraph text
         Range r = document.getRange();
         ListManager listManager = new ListManager(document);
@@ -169,9 +189,11 @@ public class WordExtractor extends AbstractPOIFSExtractor {
             i += handleParagraph(p, 0, r, document, FieldsDocumentPart.MAIN, pictures, pictureTable, listManager, xhtml);
         }
 
-        // Do everything else
-        for (String paragraph : wordExtractor.getMainTextboxText()) {
-            xhtml.element("p", paragraph);
+        if (officeParserConfig.getIncludeShapeBasedContent()) {
+            // Do everything else
+            for (String paragraph : wordExtractor.getMainTextboxText()) {
+                xhtml.element("p", paragraph);
+            }
         }
 
         for (String paragraph : wordExtractor.getFootnoteText()) {
@@ -186,11 +208,12 @@ public class WordExtractor extends AbstractPOIFSExtractor {
             xhtml.element("p", paragraph);
         }
 
-        // Do any footers, if present
-        Range[] footers = new Range[]{headerFooter.getFirstFooterSubrange(),
-                headerFooter.getEvenFooterSubrange(), headerFooter.getOddFooterSubrange()};
-        handleHeaderFooter(footers, "footer", document, pictures, pictureTable, xhtml);
-
+        if (officeParserConfig.getIncludeHeadersAndFooters()) {
+            // Do any footers, if present
+            Range[] footers = new Range[]{headerFooter.getFirstFooterSubrange(),
+                    headerFooter.getEvenFooterSubrange(), headerFooter.getOddFooterSubrange()};
+            handleHeaderFooter(footers, "footer", document, pictures, pictureTable, xhtml);
+        }
         // Handle any pictures that we haven't output yet
         for (Picture p = pictures.nextUnclaimed(); p != null; ) {
             handlePictureCharacterRun(
@@ -209,6 +232,16 @@ public class WordExtractor extends AbstractPOIFSExtractor {
                 }
             }
         } catch (FileNotFoundException e) {
+        }
+    }
+
+    private void extractSavedByMetadata(HWPFDocument document) {
+        SavedByTable savedByTable = document.getSavedByTable();
+        if (savedByTable == null) {
+            return;
+        }
+        for (SavedByEntry sbe : savedByTable.getEntries()) {
+            metadata.add(TikaCoreProperties.ORIGINAL_RESOURCE_NAME, sbe.getSaveLocation());
         }
     }
 
@@ -308,7 +341,12 @@ public class WordExtractor extends AbstractPOIFSExtractor {
                     // class="embedded" id="_X"/> so consumer can see where
                     // in the main text each embedded document
                     // occurred:
-                    String id = "_" + field.getMarkSeparatorCharacterRun(r).getPicOffset();
+                    String id = "_unknown_id";
+                    //this can return null (TIKA-1956)
+                    CharacterRun mscr = field.getMarkSeparatorCharacterRun(r);
+                    if (mscr != null) {
+                        id = "_" + mscr.getPicOffset();
+                    }
                     AttributesImpl attributes = new AttributesImpl();
                     attributes.addAttribute("", "class", "class", "CDATA", "embedded");
                     attributes.addAttribute("", "id", "id", "CDATA", id);
@@ -337,20 +375,8 @@ public class WordExtractor extends AbstractPOIFSExtractor {
             }
         }
 
-        // Close any still open style tags
-        if (curStrikeThrough) {
-            xhtml.endElement("s");
-            curStrikeThrough = false;
-        }
-        if (curItalic) {
-            xhtml.endElement("i");
-            curItalic = false;
-        }
-        if (curBold) {
-            xhtml.endElement("b");
-            curBold = false;
-        }
-
+        closeStyleElements(false, xhtml);
+        
         xhtml.endElement(tas.getTag());
 
         return 0;
@@ -364,7 +390,11 @@ public class WordExtractor extends AbstractPOIFSExtractor {
 
         if (!skipStyling) {
             if (cr.isBold() != curBold) {
-                // Enforce nesting -- must close s and i tags
+                // Enforce nesting -- must close u, s and i tags
+                if (curUnderline) {
+                    xhtml.endElement("u");
+                    curUnderline = false;
+                }
                 if (curStrikeThrough) {
                     xhtml.endElement("s");
                     curStrikeThrough = false;
@@ -382,7 +412,11 @@ public class WordExtractor extends AbstractPOIFSExtractor {
             }
 
             if (cr.isItalic() != curItalic) {
-                // Enforce nesting -- must close s tag
+                // Enforce nesting -- must close u and s tag
+            	if (curUnderline) {
+            		xhtml.endElement("u");
+            		curUnderline = false;
+            	}
                 if (curStrikeThrough) {
                     xhtml.endElement("s");
                     curStrikeThrough = false;
@@ -396,12 +430,27 @@ public class WordExtractor extends AbstractPOIFSExtractor {
             }
 
             if (cr.isStrikeThrough() != curStrikeThrough) {
+                // Enforce nesting -- must close u tag
+                if (curUnderline) {
+                    xhtml.endElement("u");
+                    curUnderline = false;
+                }
                 if (cr.isStrikeThrough()) {
                     xhtml.startElement("s");
                 } else {
                     xhtml.endElement("s");
                 }
                 curStrikeThrough = cr.isStrikeThrough();
+            }
+            
+            boolean isUnderline = cr.getUnderlineCode() != 0;
+            if (isUnderline != curUnderline) {
+                if (isUnderline) {
+                    xhtml.startElement("u");
+                } else {
+                    xhtml.endElement("u");
+                }
+                curUnderline = isUnderline;
             }
         }
 
@@ -452,6 +501,8 @@ public class WordExtractor extends AbstractPOIFSExtractor {
                     controls = new ArrayList<CharacterRun>();
                 }
                 break;
+            } else if (cr.text().equals("\u0014\u0015")) {
+                has14 = true;
             } else {
                 if (has14) {
                     texts.add(cr);
@@ -478,9 +529,11 @@ public class WordExtractor extends AbstractPOIFSExtractor {
                 }
 
                 xhtml.startElement("a", "href", url);
+                closeStyleElements(skipStyling, xhtml);
                 for (CharacterRun cr : texts) {
                     handleCharacterRun(cr, skipStyling, xhtml);
                 }
+                closeStyleElements(skipStyling, xhtml);
                 xhtml.endElement("a");
             } else {
                 // Just output the text ones
@@ -503,6 +556,28 @@ public class WordExtractor extends AbstractPOIFSExtractor {
 
         // Tell them how many to skip over
         return i - index;
+    }
+
+    private void closeStyleElements(boolean skipStyling, XHTMLContentHandler xhtml) throws SAXException {
+        if (skipStyling) {
+            return;
+        }
+        if (curUnderline) {
+        	xhtml.endElement("u");
+        	curUnderline = false;
+        }
+        if (curStrikeThrough) {
+            xhtml.endElement("s");
+            curStrikeThrough = false;
+        }
+        if (curItalic) {
+            xhtml.endElement("i");
+            curItalic = false;
+        }
+        if (curBold) {
+            xhtml.endElement("b");
+            curBold = false;
+        }
     }
 
     //temporary work around for TIKA-1512
@@ -609,7 +684,11 @@ public class WordExtractor extends AbstractPOIFSExtractor {
      * @return true if character run should be included in extraction.
      */
     private boolean isRendered(final CharacterRun cr) {
-        return cr == null || !cr.isMarkedDeleted();
+        if (cr == null) {
+            return true;
+        }
+        return !cr.isMarkedDeleted() ||
+                (cr.isMarkedDeleted() && officeParserConfig.getIncludeDeletedContent());
     }
 
     public static class TagAndStyle {
@@ -637,6 +716,9 @@ public class WordExtractor extends AbstractPOIFSExtractor {
     /**
      * Provides access to the pictures both by offset, iteration
      * over the un-claimed, and peeking forward
+     * 
+     * TODO When POI 3.18 is out, replace this with PictureRunMapper,
+     *  which is this class ported over into POI core
      */
     private static class PicturesSource {
         private PicturesTable picturesTable;

@@ -131,7 +131,7 @@ public class MimeTypesReaderTest {
      */
     @Test
     public void testReadExtendedMetadata() throws Exception {
-        MimeType mime = this.mimeTypes.forName("image/x-ms-bmp");
+        MimeType mime = this.mimeTypes.forName("image/bmp");
         assertEquals("BMP", mime.getAcronym());
         assertEquals("com.microsoft.bmp", mime.getUniformTypeIdentifier());
         assertEquals("http://en.wikipedia.org/wiki/BMP_file_format", 
@@ -231,6 +231,22 @@ public class MimeTypesReaderTest {
        } catch (Exception e) {
           fail(e.getMessage());
        }
+    }
+    
+    private class CustomClassLoader extends ClassLoader{
+    }
+    
+    /**
+     * TIKA-2460 Test loading of custom-mimetypes.xml from sys prop.
+     */
+    @Test
+    public void testExternalMimeTypes() throws Exception {
+        System.setProperty(MimeTypesFactory.CUSTOM_MIMES_SYS_PROP, 
+                "src/test/resources/org/apache/tika/mime/external-mimetypes.xml");
+        MimeTypes mimeTypes = MimeTypes.getDefaultMimeTypes(new CustomClassLoader());
+        Metadata m = new Metadata();
+        m.add(Metadata.RESOURCE_NAME_KEY, "test.external.mime.type");
+        assertEquals("external/mime-type", mimeTypes.detect(null, m).toString());
     }
     
     @Test

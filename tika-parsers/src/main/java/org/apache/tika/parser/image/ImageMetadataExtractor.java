@@ -16,6 +16,7 @@
  */
 package org.apache.tika.parser.image;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -48,13 +49,18 @@ import com.drew.metadata.exif.GpsDirectory;
 import com.drew.metadata.iptc.IptcDirectory;
 import com.drew.metadata.jpeg.JpegCommentDirectory;
 import com.drew.metadata.jpeg.JpegDirectory;
-import com.drew.metadata.xmp.XmpReader;
+import org.apache.jempbox.xmp.XMPMetadata;
 import org.apache.poi.util.IOUtils;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.IPTC;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
+import org.apache.tika.metadata.TIFF;
 import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
+import org.apache.tika.parser.image.xmp.JempboxExtractor;
+import org.apache.tika.utils.XMLReaderUtils;
+import org.w3c.dom.Document;
 import org.xml.sax.SAXException;
 
 /**
@@ -76,6 +82,7 @@ public class ImageMetadataExtractor {
     public ImageMetadataExtractor(Metadata metadata) {
         this(metadata,
                 new CopyUnknownFieldsHandler(),
+                new TiffPageNumberHandler(),
                 new JpegCommentHandler(),
                 new ExifHandler(),
                 new DimensionsHandler(),
@@ -173,15 +180,22 @@ public class ImageMetadataExtractor {
 
     public void parseRawXMP(byte[] xmpData)
             throws IOException, SAXException, TikaException {
-        com.drew.metadata.Metadata metadata = new com.drew.metadata.Metadata();
-        XmpReader reader = new XmpReader();
-        reader.extract(xmpData, metadata);
-
-        try {
-            handle(metadata);
-        } catch (MetadataException e) {
-            throw new TikaException("Can't process the XMP Data", e);
+        XMPMetadata xmp = null;
+        try (InputStream decoded =
+                     new ByteArrayInputStream(xmpData)
+        ) {
+            Document dom = XMLReaderUtils.getDocumentBuilder().parse(decoded);
+            if (dom != null) {
+                xmp = new XMPMetadata(dom);
+            }
+        } catch (IOException|SAXException e) {
+            //
         }
+        if (xmp != null) {
+            JempboxExtractor.extractDublinCore(xmp, metadata);
+            JempboxExtractor.extractXMPMM(xmp, metadata);
+        }
+
     }
 
     /**
@@ -279,6 +293,28 @@ public class ImageMetadataExtractor {
         }
     }
 
+    static class TiffPageNumberHandler implements DirectoryHandler {
+        public boolean supports(Class<? extends Directory> directoryType) {
+            return true;
+        }
+
+        public void handle(Directory directory, Metadata metadata)
+                throws MetadataException {
+            //TODO: after upgrading metadataextractor, swap out
+            //magic number with ExifDirectoryBase.TAG_PAGE_NUMBER
+            if (directory.containsTag(297)) {
+                int[] pageNums = directory.getIntArray(297);
+                //pages can be in any order, take the max
+                if (pageNums != null && pageNums.length > 1) {
+                    Integer curr = metadata.getInt(TIFF.EXIF_PAGE_COUNT);
+                    if (curr == null || curr < pageNums[1]) {
+                        metadata.set(TIFF.EXIF_PAGE_COUNT, pageNums[1]);
+                    }
+                }
+            }
+        }
+    }
+
     /**
      * Basic image properties for TIFF and JPEG, at least.
      */
@@ -330,12 +366,9 @@ public class ImageMetadataExtractor {
 
     static class ExifHandler implements DirectoryHandler {
         // There's a new ExifHandler for each file processed, so this is thread safe
-        private static final ThreadLocal<SimpleDateFormat> DATE_UNSPECIFIED_TZ = new ThreadLocal<SimpleDateFormat>() {
-            @Override
-            protected SimpleDateFormat initialValue() {
-                return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
-            }
-        };
+        private final SimpleDateFormat dateUnspecifiedTz =
+                new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
+
 
         public boolean supports(Class<? extends Directory> directoryType) {
             return directoryType == ExifIFD0Directory.class ||
@@ -380,12 +413,14 @@ public class ImageMetadataExtractor {
 
             if (directory.containsTag(ExifSubIFDDirectory.TAG_FLASH)) {
                 String flash = directory.getDescription(ExifSubIFDDirectory.TAG_FLASH);
-                if (flash.contains("Flash fired")) {
-                    metadata.set(Metadata.FLASH_FIRED, Boolean.TRUE.toString());
-                } else if (flash.contains("Flash did not fire")) {
-                    metadata.set(Metadata.FLASH_FIRED, Boolean.FALSE.toString());
-                } else {
-                    metadata.set(Metadata.FLASH_FIRED, flash);
+                if (flash != null) {
+                    if (flash.contains("Flash fired")) {
+                        metadata.set(Metadata.FLASH_FIRED, Boolean.TRUE.toString());
+                    } else if (flash.contains("Flash did not fire")) {
+                        metadata.set(Metadata.FLASH_FIRED, Boolean.FALSE.toString());
+                    } else {
+                        metadata.set(Metadata.FLASH_FIRED, flash);
+                    }
                 }
             }
 
@@ -465,6 +500,8 @@ public class ImageMetadataExtractor {
          */
         public void handleDateTags(Directory directory, Metadata metadata)
                 throws MetadataException {
+            //TODO: should we try to process ExifSubIFDDirectory.TAG_TIME_ZONE_OFFSET
+            //if it exists?
             // Date/Time Original overrides value from ExifDirectory.TAG_DATETIME
             Date original = null;
             if (directory.containsTag(ExifSubIFDDirectory.TAG_DATETIME_ORIGINAL)) {
@@ -472,7 +509,7 @@ public class ImageMetadataExtractor {
                 // Unless we have GPS time we don't know the time zone so date must be set
                 // as ISO 8601 datetime without timezone suffix (no Z or +/-)
                 if (original != null) {
-                    String datetimeNoTimeZone = DATE_UNSPECIFIED_TZ.get().format(original); // Same time zone as Metadata Extractor uses
+                    String datetimeNoTimeZone = dateUnspecifiedTz.format(original); // Same time zone as Metadata Extractor uses
                     metadata.set(TikaCoreProperties.CREATED, datetimeNoTimeZone);
                     metadata.set(Metadata.ORIGINAL_DATE, datetimeNoTimeZone);
                 }
@@ -480,7 +517,7 @@ public class ImageMetadataExtractor {
             if (directory.containsTag(ExifIFD0Directory.TAG_DATETIME)) {
                 Date datetime = directory.getDate(ExifIFD0Directory.TAG_DATETIME);
                 if (datetime != null) {
-                    String datetimeNoTimeZone = DATE_UNSPECIFIED_TZ.get().format(datetime);
+                    String datetimeNoTimeZone = dateUnspecifiedTz.format(datetime);
                     metadata.set(TikaCoreProperties.MODIFIED, datetimeNoTimeZone);
                     // If Date/Time Original does not exist this might be creation date
                     if (metadata.get(TikaCoreProperties.CREATED) == null) {

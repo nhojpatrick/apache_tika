@@ -75,11 +75,19 @@ class BatchCommandLineBuilder {
         //now build the full command line
         List<String> fullCommand = new ArrayList<String>();
         fullCommand.add("java");
+        boolean foundHeadlessOption = false;
         for (Map.Entry<String, String> e : jvmOpts.entrySet()) {
             fullCommand.add(e.getKey());
             if (e.getValue().length() > 0) {
                 fullCommand.add(e.getValue());
             }
+            if (e.getKey().contains("java.awt.headless")) {
+                foundHeadlessOption = true;
+            }
+        }
+        //run in headless mode unless the user asks for something else TIKA-2434
+        if (! foundHeadlessOption) {
+            fullCommand.add("-Djava.awt.headless=true");
         }
         fullCommand.add("org.apache.tika.batch.fs.FSBatchProcessCLI");
         //now add the process commands
@@ -160,35 +168,28 @@ class BatchCommandLineBuilder {
             map.remove("-h");
             map.remove("--html");
             map.put("-basicHandlerType", "html");
-            map.put("-outputSuffix", "html");
         } else if (map.containsKey("-x") || map.containsKey("--xml")) {
             map.remove("-x");
             map.remove("--xml");
             map.put("-basicHandlerType", "xml");
-            map.put("-outputSuffix", "xml");
         } else if (map.containsKey("-t") || map.containsKey("--text")) {
             map.remove("-t");
             map.remove("--text");
             map.put("-basicHandlerType", "text");
-            map.put("-outputSuffix", "txt");
         } else if (map.containsKey("-m") || map.containsKey("--metadata")) {
             map.remove("-m");
             map.remove("--metadata");
             map.put("-basicHandlerType", "ignore");
-            map.put("-outputSuffix", "json");
         } else if (map.containsKey("-T") || map.containsKey("--text-main")) {
             map.remove("-T");
             map.remove("--text-main");
             map.put("-basicHandlerType", "body");
-            map.put("-outputSuffix", "txt");
         }
 
         if (map.containsKey("-J") || map.containsKey("--jsonRecursive")) {
             map.remove("-J");
             map.remove("--jsonRecursive");
             map.put("-recursiveParserWrapper", "true");
-            //overwrite outputSuffix
-            map.put("-outputSuffix", "json");
         }
 
         if (map.containsKey("--inputDir") || map.containsKey("-i")) {

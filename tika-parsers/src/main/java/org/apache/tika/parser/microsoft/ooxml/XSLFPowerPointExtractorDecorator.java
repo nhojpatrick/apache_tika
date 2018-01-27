@@ -19,21 +19,25 @@ package org.apache.tika.parser.microsoft.ooxml;
 import javax.xml.namespace.QName;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 
+import org.apache.poi.common.usermodel.Hyperlink;
 import org.apache.poi.openxml4j.exceptions.InvalidFormatException;
 import org.apache.poi.openxml4j.opc.PackagePart;
 import org.apache.poi.openxml4j.opc.PackagePartName;
 import org.apache.poi.openxml4j.opc.PackageRelationship;
+import org.apache.poi.openxml4j.opc.PackageRelationshipCollection;
 import org.apache.poi.openxml4j.opc.PackagingURIHelper;
 import org.apache.poi.openxml4j.opc.TargetMode;
-import org.apache.poi.sl.usermodel.SimpleShape;
+import org.apache.poi.sl.usermodel.Placeholder;
 import org.apache.poi.xslf.extractor.XSLFPowerPointExtractor;
 import org.apache.poi.xslf.usermodel.XMLSlideShow;
 import org.apache.poi.xslf.usermodel.XSLFCommentAuthors;
 import org.apache.poi.xslf.usermodel.XSLFComments;
 import org.apache.poi.xslf.usermodel.XSLFGraphicFrame;
 import org.apache.poi.xslf.usermodel.XSLFGroupShape;
+import org.apache.poi.xslf.usermodel.XSLFHyperlink;
 import org.apache.poi.xslf.usermodel.XSLFNotes;
 import org.apache.poi.xslf.usermodel.XSLFNotesMaster;
 import org.apache.poi.xslf.usermodel.XSLFPictureShape;
@@ -47,8 +51,10 @@ import org.apache.poi.xslf.usermodel.XSLFTable;
 import org.apache.poi.xslf.usermodel.XSLFTableCell;
 import org.apache.poi.xslf.usermodel.XSLFTableRow;
 import org.apache.poi.xslf.usermodel.XSLFTextParagraph;
+import org.apache.poi.xslf.usermodel.XSLFTextRun;
 import org.apache.poi.xslf.usermodel.XSLFTextShape;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.XHTMLContentHandler;
 import org.apache.xmlbeans.XmlException;
@@ -62,8 +68,24 @@ import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
 
 public class XSLFPowerPointExtractorDecorator extends AbstractOOXMLExtractor {
-    public XSLFPowerPointExtractorDecorator(ParseContext context, XSLFPowerPointExtractor extractor) {
+
+    private final static String HANDOUT_MASTER = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/handoutMaster";
+
+    private Metadata metadata;
+
+    public XSLFPowerPointExtractorDecorator(Metadata metadata, ParseContext context, XSLFPowerPointExtractor extractor) {
         super(context, extractor);
+        this.metadata = metadata;
+    }
+
+    /**
+     * use {@link XSLFPowerPointExtractorDecorator#XSLFPowerPointExtractorDecorator(Metadata, ParseContext, XSLFPowerPointExtractor)}
+     * @param context
+     * @param extractor
+     */
+    @Deprecated
+    public XSLFPowerPointExtractorDecorator(ParseContext context, XSLFPowerPointExtractor extractor) {
+        this(new Metadata(),context, extractor);
     }
 
     /**
@@ -107,7 +129,9 @@ public class XSLFPowerPointExtractorDecorator extends AbstractOOXMLExtractor {
 
                 // master sheet for this notes
                 XSLFNotesMaster notesMaster = slideNotes.getMasterSheet();
-                extractContent(notesMaster.getShapes(), true, xhtml, null);
+                if (notesMaster != null) {
+                    extractContent(notesMaster.getShapes(), true, xhtml, null);
+                }
                 xhtml.endElement("div");
             }
 
@@ -143,6 +167,28 @@ public class XSLFPowerPointExtractorDecorator extends AbstractOOXMLExtractor {
                     xhtml.endElement("p");
                 }
             }
+            //now dump diagram data
+            handleGeneralTextContainingPart(
+                    RELATION_DIAGRAM_DATA,
+                    "diagram-data",
+                    slide.getPackagePart(),
+                    metadata,
+                    new OOXMLWordAndPowerPointTextHandler(
+                            new OOXMLTikaBodyPartHandler(xhtml),
+                            new HashMap<String, String>()//empty
+                    )
+            );
+            //now dump chart data
+            handleGeneralTextContainingPart(
+                    XSLFRelation.CHART.getRelation(),
+                    "chart",
+                    slide.getPackagePart(),
+                    metadata,
+                    new OOXMLWordAndPowerPointTextHandler(
+                            new OOXMLTikaBodyPartHandler(xhtml),
+                            new HashMap<String, String>()//empty
+                    )
+            );
         }
     }
 
@@ -151,12 +197,32 @@ public class XSLFPowerPointExtractorDecorator extends AbstractOOXMLExtractor {
         for (XSLFShape sh : shapes) {
             if (sh instanceof XSLFTextShape) {
                 XSLFTextShape txt = (XSLFTextShape) sh;
-                SimpleShape.Placeholder ph = txt.getTextType();
+                Placeholder ph = txt.getTextType();
                 if (skipPlaceholders && ph != null) {
                     continue;
                 }
+                boolean inHyperlink = false;
                 for (XSLFTextParagraph p : txt.getTextParagraphs()) {
-                    xhtml.element("p", p.getText());
+                    xhtml.startElement("p");
+
+                    for (XSLFTextRun run : p.getTextRuns()) {
+                        //TODO: add check for targetmode=external into POI
+                        //then check to confirm that the urls are actually
+                        //external and not footnote refs via the current hack
+                        Hyperlink hyperlink = run.getHyperlink();
+
+                        if (hyperlink != null && hyperlink.getAddress() != null
+                                && !hyperlink.getAddress().contains("#_ftn")) {
+                            xhtml.startElement("a", "href", hyperlink.getAddress());
+                            inHyperlink = true;
+                        }
+                        xhtml.characters(run.getRawText());
+                        if (inHyperlink == true) {
+                            xhtml.endElement("a");
+                        }
+                        inHyperlink = false;
+                    }
+                    xhtml.endElement("p");
                 }
             } else if (sh instanceof XSLFGroupShape) {
                 // recurse into groups of shapes
@@ -210,10 +276,23 @@ public class XSLFPowerPointExtractorDecorator extends AbstractOOXMLExtractor {
         xhtml.startElement("table");
         for (XSLFTableRow row : tbl) {
             xhtml.startElement("tr");
-            List<XSLFTableCell> cells = row.getCells();
             for (XSLFTableCell c : row.getCells()) {
                 xhtml.startElement("td");
+                //TODO: Need to wait for fix in POI to test for hyperlink first
+                //shouldn't need to catch NPE...
+                XSLFHyperlink hyperlink = null;
+                try {
+                    hyperlink = c.getHyperlink();
+                } catch (NullPointerException e) {
+                    //swallow
+                }
+                if (hyperlink != null && hyperlink.getAddress() != null) {
+                    xhtml.startElement("a", "href", hyperlink.getAddress());
+                }
                 xhtml.characters(c.getText());
+                if (hyperlink != null && hyperlink.getAddress() != null) {
+                    xhtml.endElement("a");
+                }
                 xhtml.endElement("td");
             }
             xhtml.endElement("tr");
@@ -249,21 +328,55 @@ public class XSLFPowerPointExtractorDecorator extends AbstractOOXMLExtractor {
                 } catch (XmlException xe) {
                     throw new TikaException("Broken OOXML file", xe);
                 }
-                parts.add(slidePart);
-
-                // If it has drawings, return those too
-                try {
-                    for (PackageRelationship rel : slidePart.getRelationshipsByType(XSLFRelation.VML_DRAWING.getRelation())) {
-                        if (rel.getTargetMode() == TargetMode.INTERNAL) {
-                            PackagePartName relName = PackagingURIHelper.createPartName(rel.getTargetURI());
-                            parts.add(rel.getPackage().getPart(relName));
-                        }
-                    }
-                } catch (InvalidFormatException e) {
-                    throw new TikaException("Broken OOXML file", e);
-                }
+                addSlideParts(slidePart, parts);
             }
         }
+        //add full document to include macros
+        parts.add(document.getPackagePart());
+
+        for (String rel : new String[]{
+                XSLFRelation.SLIDE_MASTER.getRelation(),
+                HANDOUT_MASTER}) {
+            try {
+                PackageRelationshipCollection prc = document.getPackagePart().getRelationshipsByType(rel);
+                for (int i = 0; i < prc.size(); i++) {
+                    PackagePart pp = document.getPackagePart().getRelatedPart(prc.getRelationship(i));
+                    if (pp != null) {
+                        parts.add(pp);
+                    }
+                }
+
+            } catch (InvalidFormatException e) {
+                //log
+            }
+        }
+
         return parts;
     }
+
+
+    private void addSlideParts(PackagePart slidePart, List<PackagePart> parts) {
+
+        for (String relation : new String[]{
+                XSLFRelation.VML_DRAWING.getRelation(),
+                XSLFRelation.SLIDE_LAYOUT.getRelation(),
+                XSLFRelation.NOTES_MASTER.getRelation(),
+                XSLFRelation.NOTES.getRelation()
+        }) {
+            try {
+                for (PackageRelationship packageRelationship : slidePart.getRelationshipsByType(relation)) {
+                    if (packageRelationship.getTargetMode() == TargetMode.INTERNAL) {
+                        PackagePartName relName = PackagingURIHelper.createPartName(packageRelationship.getTargetURI());
+                        parts.add(packageRelationship.getPackage().getPart(relName));
+                    }
+                }
+            } catch (InvalidFormatException e) {
+
+            }
+        }
+        //and slide of course
+        parts.add(slidePart);
+
+    }
+
 }

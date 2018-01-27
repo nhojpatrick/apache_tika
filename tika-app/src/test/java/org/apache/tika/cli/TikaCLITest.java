@@ -29,6 +29,7 @@ import org.apache.commons.io.FileUtils;
 import org.apache.tika.exception.TikaException;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 
 /**
@@ -37,7 +38,6 @@ import org.junit.Test;
 public class TikaCLITest {
 
     /* Test members */
-    private File profile = null;
     private ByteArrayOutputStream outContent = null;
     private PrintStream stdout = null;
     private File testDataFile = new File("src/test/resources/test-data");
@@ -46,23 +46,10 @@ public class TikaCLITest {
 
     @Before
     public void setUp() throws Exception {
-        profile = new File("welsh.ngp");
         outContent = new ByteArrayOutputStream();
         resourcePrefix = testDataURI.toString();
         stdout = System.out;
         System.setOut(new PrintStream(outContent, true, UTF_8.name()));
-    }
-
-    /**
-     * Creates a welsh language profile
-     * 
-     * @throws Exception
-     */
-    @Test
-    public void testCreateProfile() throws Exception {
-        String[] params = {"--create-profile=welsh", "-eUTF-8", resourcePrefix + "welsh_corpus.txt"};
-        TikaCLI.main(params);
-        assertTrue(profile.exists());
     }
 
     /**
@@ -254,8 +241,6 @@ public class TikaCLITest {
      */
     @After
     public void tearDown() throws Exception {
-        if(profile != null && profile.exists())
-            profile.delete();
         System.setOut(stdout);
     }
 
@@ -264,19 +249,19 @@ public class TikaCLITest {
         File tempFile = File.createTempFile("tika-test-", "");
         tempFile.delete();
         tempFile.mkdir(); // not really good method for production usage, but ok for tests
-                          // google guava library has better solution
+        // google guava library has better solution
 
         try {
             String[] params = {"--extract-dir="+tempFile.getAbsolutePath(),"-z", resourcePrefix + "/coffee.xls"};
-            
+
             TikaCLI.main(params);
-            
+
             StringBuffer allFiles = new StringBuffer();
             for (String f : tempFile.list()) {
                 if (allFiles.length() > 0) allFiles.append(" : ");
                 allFiles.append(f);
             }
-            
+
             // ChemDraw file
             File expectedCDX = new File(tempFile, "MBD002B040A.cdx");
             // Image of the ChemDraw molecule
@@ -287,7 +272,7 @@ public class TikaCLITest {
             File expected262FE3 = new File(tempFile, "MBD00262FE3.txt");
             // Image of one of the embedded resources
             File expectedEMF = new File(tempFile, "file0.emf");
-            
+
             assertExtracted(expectedCDX, allFiles.toString());
             assertExtracted(expectedIMG, allFiles.toString());
             assertExtracted(expectedOLE10, allFiles.toString());
@@ -341,6 +326,38 @@ public class TikaCLITest {
     }
 
     @Test
+    public void testExtractInlineImages() throws Exception {
+        File tempFile = File.createTempFile("tika-test-", "");
+        tempFile.delete();
+        tempFile.mkdir(); // not really good method for production usage, but ok for tests
+        // google guava library has better solution
+
+        try {
+            String[] params = {"--extract-dir="+tempFile.getAbsolutePath(),"-z", resourcePrefix + "/testPDF_childAttachments.pdf"};
+
+            TikaCLI.main(params);
+
+            StringBuffer allFiles = new StringBuffer();
+            for (String f : tempFile.list()) {
+                if (allFiles.length() > 0) allFiles.append(" : ");
+                allFiles.append(f);
+            }
+
+            File jpeg = new File(tempFile, "image0.jpg");
+            //tiff isn't extracted without optional image dependency
+//            File tiff = new File(tempFile, "image1.tif");
+            File jobOptions = new File(tempFile, "Press Quality(1).joboptions");
+            File doc = new File(tempFile, "Unit10.doc");
+
+            assertExtracted(jpeg, allFiles.toString());
+            assertExtracted(jobOptions, allFiles.toString());
+            assertExtracted(doc, allFiles.toString());
+        } finally {
+            FileUtils.deleteDirectory(tempFile);
+        }
+    }
+
+    @Test
     public void testDefaultConfigException() throws Exception {
         //default xml parser will throw TikaException
         //this and TestConfig() are broken into separate tests so that
@@ -363,6 +380,18 @@ public class TikaCLITest {
         assertTrue(content.contains("apple"));
         assertTrue(content.contains("org.apache.tika.parser.html.HtmlParser"));
     }
+
+    @Test
+    public void testConfigIgnoreInit() throws Exception {
+        String[] params = new String[]{"--config="+testDataFile.toString()+"/TIKA-2389-ignore-init-problems.xml",
+                resourcePrefix+"test_recursive_embedded.docx"};
+        TikaCLI.main(params);
+        String content = outContent.toString(UTF_8.name());
+        assertTrue(content.contains("embed_1a"));
+        //TODO: add a real unit test that configures logging to a file to test that nothing is
+        //written at the various logging levels
+    }
+
 
     @Test
     public void testJsonRecursiveMetadataParserMetadataOnly() throws Exception {

@@ -19,9 +19,13 @@ package org.apache.tika.parser.microsoft.ooxml;
 import javax.xml.namespace.QName;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 
+import org.apache.poi.openxml4j.exceptions.InvalidFormatException;
 import org.apache.poi.openxml4j.opc.PackagePart;
+import org.apache.poi.openxml4j.opc.PackageRelationshipCollection;
+import org.apache.poi.xssf.usermodel.XSSFRelation;
 import org.apache.poi.xwpf.extractor.XWPFWordExtractor;
 import org.apache.poi.xwpf.model.XWPFCommentsDecorator;
 import org.apache.poi.xwpf.model.XWPFHeaderFooterPolicy;
@@ -31,6 +35,7 @@ import org.apache.poi.xwpf.usermodel.IBodyElement;
 import org.apache.poi.xwpf.usermodel.ICell;
 import org.apache.poi.xwpf.usermodel.IRunElement;
 import org.apache.poi.xwpf.usermodel.ISDTContent;
+import org.apache.poi.xwpf.usermodel.UnderlinePatterns;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.apache.poi.xwpf.usermodel.XWPFHeaderFooter;
 import org.apache.poi.xwpf.usermodel.XWPFHyperlink;
@@ -38,6 +43,7 @@ import org.apache.poi.xwpf.usermodel.XWPFHyperlinkRun;
 import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import org.apache.poi.xwpf.usermodel.XWPFPicture;
 import org.apache.poi.xwpf.usermodel.XWPFPictureData;
+import org.apache.poi.xwpf.usermodel.XWPFRelation;
 import org.apache.poi.xwpf.usermodel.XWPFRun;
 import org.apache.poi.xwpf.usermodel.XWPFSDT;
 import org.apache.poi.xwpf.usermodel.XWPFSDTCell;
@@ -46,6 +52,7 @@ import org.apache.poi.xwpf.usermodel.XWPFStyles;
 import org.apache.poi.xwpf.usermodel.XWPFTable;
 import org.apache.poi.xwpf.usermodel.XWPFTableCell;
 import org.apache.poi.xwpf.usermodel.XWPFTableRow;
+import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.microsoft.WordExtractor;
 import org.apache.tika.parser.microsoft.WordExtractor.TagAndStyle;
@@ -66,14 +73,36 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
     private static final String LIST_DELIMITER = " ";
 
 
+    //include all parts that might have embedded objects
+    private final static String[] MAIN_PART_RELATIONS = new String[]{
+            XWPFRelation.HEADER.getRelation(),
+            XWPFRelation.FOOTER.getRelation(),
+            XWPFRelation.FOOTNOTE.getRelation(),
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+            AbstractOOXMLExtractor.RELATION_DIAGRAM_DATA
+    };
+
+
     private XWPFDocument document;
     private XWPFStyles styles;
+    private Metadata metadata;
 
-    public XWPFWordExtractorDecorator(ParseContext context, XWPFWordExtractor extractor) {
+    public XWPFWordExtractorDecorator(Metadata metadata, ParseContext context, XWPFWordExtractor extractor) {
         super(context, extractor);
-
+        this.metadata = metadata;
         document = (XWPFDocument) extractor.getDocument();
         styles = document.getStyles();
+    }
+
+    /**
+     * @deprecated use {@link XWPFWordExtractorDecorator#XWPFWordExtractorDecorator(Metadata, ParseContext, XWPFWordExtractor)}
+     * @param context
+     * @param extractor
+     */
+    @Deprecated
+    public XWPFWordExtractorDecorator(ParseContext context, XWPFWordExtractor extractor) {
+        this(new Metadata(), context, extractor);
     }
 
     /**
@@ -83,17 +112,40 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
     protected void buildXHTML(XHTMLContentHandler xhtml)
             throws SAXException, XmlException, IOException {
         XWPFHeaderFooterPolicy hfPolicy = document.getHeaderFooterPolicy();
-        XWPFListManager listManager = new XWPFListManager(document);
+        XWPFListManager listManager = new XWPFListManager(document.getNumbering());
         // headers
-        if (hfPolicy != null) {
+        if (hfPolicy != null && config.getIncludeHeadersAndFooters()) {
             extractHeaders(xhtml, hfPolicy, listManager);
         }
 
         // process text in the order that it occurs in
         extractIBodyText(document, listManager, xhtml);
 
-        // then all document tables
-        if (hfPolicy != null) {
+        //handle the diagram data
+        handleGeneralTextContainingPart(
+                RELATION_DIAGRAM_DATA,
+                "diagram-data",
+                document.getPackagePart(),
+                metadata,
+                new OOXMLWordAndPowerPointTextHandler(
+                        new OOXMLTikaBodyPartHandler(xhtml),
+                        new HashMap<String, String>()//empty
+                )
+        );
+        //handle chart data
+        handleGeneralTextContainingPart(
+                XSSFRelation.CHART.getRelation(),
+                "chart",
+                document.getPackagePart(),
+                metadata,
+                new OOXMLWordAndPowerPointTextHandler(
+                        new OOXMLTikaBodyPartHandler(xhtml),
+                        new HashMap<String, String>()//empty
+                )
+        );
+
+        // then all document footers
+        if (hfPolicy != null && config.getIncludeHeadersAndFooters()) {
             extractFooters(xhtml, hfPolicy, listManager);
         }
     }
@@ -135,7 +187,7 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
         XWPFHeaderFooterPolicy headerFooterPolicy = null;
         if (paragraph.getCTP().getPPr() != null) {
             CTSectPr ctSectPr = paragraph.getCTP().getPPr().getSectPr();
-            if (ctSectPr != null) {
+            if (ctSectPr != null && config.getIncludeHeadersAndFooters()) {
                 headerFooterPolicy =
                         new XWPFHeaderFooterPolicy(document, ctSectPr);
                 extractHeaders(xhtml, headerFooterPolicy, listManager);
@@ -145,7 +197,8 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
         // Is this a paragraph, or a heading?
         String tag = "p";
         String styleClass = null;
-        if (paragraph.getStyleID() != null) {
+        //TIKA-2144 check that styles is not null
+        if (paragraph.getStyleID() != null && styles != null) {
             XWPFStyle style = styles.getStyle(
                     paragraph.getStyleID()
             );
@@ -210,10 +263,42 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
             xhtml.endElement("a");
         }
 
-        TmpFormatting fmtg = new TmpFormatting(false, false);
+        TmpFormatting fmtg = new TmpFormatting(false, false, false, false);
 
+        //hyperlinks may or may not have hyperlink ids
+        String lastHyperlinkId = null;
+        boolean inHyperlink = false;
         // Do the iruns
         for (IRunElement run : paragraph.getIRuns()) {
+
+            if (run instanceof XWPFHyperlinkRun) {
+                XWPFHyperlinkRun hyperlinkRun = (XWPFHyperlinkRun) run;
+                if (hyperlinkRun.getHyperlinkId() == null ||
+                        !hyperlinkRun.getHyperlinkId().equals(lastHyperlinkId)) {
+                    if (inHyperlink) {
+                        //close out the old one
+                        xhtml.endElement("a");
+                        inHyperlink = false;
+                    }
+                    lastHyperlinkId = hyperlinkRun.getHyperlinkId();
+                    fmtg = closeStyleTags(xhtml, fmtg);
+                    XWPFHyperlink link = hyperlinkRun.getHyperlink(document);
+                    if (link != null && link.getURL() != null) {
+                        xhtml.startElement("a", "href", link.getURL());
+                        inHyperlink = true;
+                    } else if (hyperlinkRun.getAnchor() != null && hyperlinkRun.getAnchor().length() > 0) {
+                        xhtml.startElement("a", "href", "#" + hyperlinkRun.getAnchor());
+                        inHyperlink = true;
+                    }
+                }
+            } else if (inHyperlink) {
+                //if this isn't a hyperlink, but the last one was
+                closeStyleTags(xhtml, fmtg);
+                xhtml.endElement("a");
+                lastHyperlinkId = null;
+                inHyperlink = false;
+            }
+
             if (run instanceof XWPFSDT) {
                 fmtg = closeStyleTags(xhtml, fmtg);
                 processSDTRun((XWPFSDT) run, xhtml);
@@ -226,6 +311,9 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
             }
         }
         closeStyleTags(xhtml, fmtg);
+        if (inHyperlink) {
+            xhtml.endElement("a");
+        }
 
 
         // Now do any comments for the paragraph
@@ -241,14 +329,16 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
         }
 
         // Also extract any paragraphs embedded in text boxes:
-        for (XmlObject embeddedParagraph : paragraph.getCTP().selectPath("declare namespace w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' declare namespace wps='http://schemas.microsoft.com/office/word/2010/wordprocessingShape' .//*/wps:txbx/w:txbxContent/w:p")) {
-            extractParagraph(new XWPFParagraph(CTP.Factory.parse(embeddedParagraph.xmlText()), paragraph.getBody()), listManager, xhtml);
+        if (config.getIncludeShapeBasedContent()) {
+            for (XmlObject embeddedParagraph : paragraph.getCTP().selectPath("declare namespace w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' declare namespace wps='http://schemas.microsoft.com/office/word/2010/wordprocessingShape' .//*/wps:txbx/w:txbxContent/w:p")) {
+                extractParagraph(new XWPFParagraph(CTP.Factory.parse(embeddedParagraph.xmlText()), paragraph.getBody()), listManager, xhtml);
+            }
         }
 
         // Finish this paragraph
         xhtml.endElement(tag);
 
-        if (headerFooterPolicy != null) {
+        if (headerFooterPolicy != null && config.getIncludeHeadersAndFooters()) {
             extractFooters(xhtml, headerFooterPolicy, listManager);
         }
     }
@@ -277,6 +367,14 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
             xhtml.endElement("b");
             fmtg.setBold(false);
         }
+        if (fmtg.isUnderline()) {
+        	xhtml.endElement("u");
+        	fmtg.setUnderline(false);
+        }
+        if (fmtg.isStrikeThrough()) {
+            xhtml.endElement("strike");
+            fmtg.setStrikeThrough(false);
+        }
         return fmtg;
     }
 
@@ -285,6 +383,14 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
             throws SAXException, XmlException, IOException {
         // True if we are currently in the named style tag:
         if (run.isBold() != tfmtg.isBold()) {
+            if (tfmtg.isStrikeThrough()) {
+                xhtml.endElement("strike");
+                tfmtg.setStrikeThrough(false);
+            }
+            if (tfmtg.isUnderline()) {
+                xhtml.endElement("u");
+                tfmtg.setUnderline(false);
+            }
             if (tfmtg.isItalic()) {
                 xhtml.endElement("i");
                 tfmtg.setItalic(false);
@@ -298,6 +404,14 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
         }
 
         if (run.isItalic() != tfmtg.isItalic()) {
+            if (tfmtg.isStrikeThrough()) {
+                xhtml.endElement("strike");
+                tfmtg.setStrikeThrough(false);
+            }
+            if (tfmtg.isUnderline()) {
+                xhtml.endElement("u");
+                tfmtg.setUnderline(false);
+            }
             if (run.isItalic()) {
                 xhtml.startElement("i");
             } else {
@@ -306,20 +420,34 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
             tfmtg.setItalic(run.isItalic());
         }
 
-        boolean addedHREF = false;
-        if (run instanceof XWPFHyperlinkRun) {
-            XWPFHyperlinkRun linkRun = (XWPFHyperlinkRun) run;
-            XWPFHyperlink link = linkRun.getHyperlink(document);
-            if (link != null && link.getURL() != null) {
-                xhtml.startElement("a", "href", link.getURL());
-                addedHREF = true;
-            } else if (linkRun.getAnchor() != null && linkRun.getAnchor().length() > 0) {
-                xhtml.startElement("a", "href", "#" + linkRun.getAnchor());
-                addedHREF = true;
+        if (run.isStrikeThrough() != tfmtg.isStrikeThrough()) {
+            if (tfmtg.isUnderline()) {
+                xhtml.endElement("u");
+                tfmtg.setUnderline(false);
             }
+            if (run.isStrikeThrough()) {
+                xhtml.startElement("strike");
+            } else {
+                xhtml.endElement("strike");
+            }
+            tfmtg.setStrikeThrough(run.isStrikeThrough());
         }
 
-        xhtml.characters(run.toString());
+        boolean isUnderline = run.getUnderline() != UnderlinePatterns.NONE;
+        if (isUnderline != tfmtg.isUnderline()) {
+            if (isUnderline) {
+                xhtml.startElement("u");
+            } else {
+                xhtml.endElement("u");
+            }
+            tfmtg.setUnderline(isUnderline);
+        }
+
+        if (config.getConcatenatePhoneticRuns()) {
+            xhtml.characters(run.toString());
+        } else {
+            xhtml.characters(run.text());
+        }
 
         // If we have any pictures, output them
         for (XWPFPicture picture : run.getEmbeddedPictures()) {
@@ -335,10 +463,6 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
                     xhtml.endElement("img");
                 }
             }
-        }
-
-        if (addedHREF) {
-            xhtml.endElement("a");
         }
 
         return tfmtg;
@@ -419,23 +543,47 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
     }
 
     /**
-     * Word documents are simple, they only have the one
-     * main part
+     * Include main body and anything else that can
+     * have an attachment/embedded object
      */
     @Override
     protected List<PackagePart> getMainDocumentParts() {
         List<PackagePart> parts = new ArrayList<PackagePart>();
         parts.add(document.getPackagePart());
+        addRelatedParts(document.getPackagePart(), parts);
         return parts;
+    }
+
+    private void addRelatedParts(PackagePart documentPart, List<PackagePart> relatedParts) {
+        for (String relation : MAIN_PART_RELATIONS) {
+            PackageRelationshipCollection prc = null;
+            try {
+                prc = documentPart.getRelationshipsByType(relation);
+                if (prc != null) {
+                    for (int i = 0; i < prc.size(); i++) {
+                        PackagePart packagePart = documentPart.getRelatedPart(prc.getRelationship(i));
+                        relatedParts.add(packagePart);
+                    }
+                }
+            } catch (InvalidFormatException e) {
+            }
+        }
+
     }
 
     private class TmpFormatting {
         private boolean bold = false;
         private boolean italic = false;
+        private boolean underline = false;
+        private boolean strikeThrough = false;
 
-        private TmpFormatting(boolean bold, boolean italic) {
+
+        private TmpFormatting(boolean bold, boolean italic, boolean underline,
+                              boolean strikeThrough) {
             this.bold = bold;
             this.italic = italic;
+            this.underline = underline;
+            this.strikeThrough = strikeThrough;
         }
 
         public boolean isBold() {
@@ -453,7 +601,23 @@ public class XWPFWordExtractorDecorator extends AbstractOOXMLExtractor {
         public void setItalic(boolean italic) {
             this.italic = italic;
         }
+        
 
+        public boolean isUnderline() {
+            return underline;
+        }
+
+        public void setUnderline(boolean underline) {
+            this.underline = underline;
+        }
+
+        public boolean isStrikeThrough() {
+            return strikeThrough;
+        }
+
+        public void setStrikeThrough(boolean strikeThrough) {
+            this.strikeThrough = strikeThrough;
+        }
     }
 
 }

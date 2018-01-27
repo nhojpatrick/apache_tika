@@ -60,11 +60,8 @@ import java.util.TreeSet;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.io.input.CloseShieldInputStream;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.log4j.Level;
 import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
 import org.apache.log4j.PropertyConfigurator;
 import org.apache.poi.poifs.filesystem.DirectoryEntry;
 import org.apache.poi.poifs.filesystem.DocumentEntry;
@@ -75,15 +72,13 @@ import org.apache.tika.batch.BatchProcessDriverCLI;
 import org.apache.tika.config.TikaConfig;
 import org.apache.tika.config.TikaConfigSerializer;
 import org.apache.tika.detect.CompositeDetector;
-import org.apache.tika.detect.DefaultDetector;
 import org.apache.tika.detect.Detector;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.fork.ForkParser;
 import org.apache.tika.gui.TikaGUI;
 import org.apache.tika.io.TikaInputStream;
-import org.apache.tika.language.LanguageProfilerBuilder;
-import org.apache.tika.language.ProfilingHandler;
+import org.apache.tika.language.detect.LanguageHandler;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.serialization.JsonMetadata;
 import org.apache.tika.metadata.serialization.JsonMetadataList;
@@ -102,12 +97,15 @@ import org.apache.tika.parser.ParserDecorator;
 import org.apache.tika.parser.PasswordProvider;
 import org.apache.tika.parser.RecursiveParserWrapper;
 import org.apache.tika.parser.html.BoilerpipeContentHandler;
+import org.apache.tika.parser.pdf.PDFParserConfig;
 import org.apache.tika.parser.utils.CommonsDigester;
 import org.apache.tika.sax.BasicContentHandlerFactory;
 import org.apache.tika.sax.BodyContentHandler;
 import org.apache.tika.sax.ContentHandlerFactory;
 import org.apache.tika.sax.ExpandedTitleContentHandler;
 import org.apache.tika.xmp.XMPMetadata;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
@@ -116,17 +114,19 @@ import org.xml.sax.helpers.DefaultHandler;
  * Simple command line interface for Apache Tika.
  */
 public class TikaCLI {
-
     private final int MAX_MARK = 20*1024*1024;//20MB
 
     private File extractDir = new File(".");
 
-    private static final Log logger = LogFactory.getLog(TikaCLI.class);
+    private static final Logger LOG = LoggerFactory.getLogger(TikaCLI.class);
 
+    public TikaCLI() {
+        context = new ParseContext();
+    }
     public static void main(String[] args) throws Exception {
-
         TikaCLI cli = new TikaCLI();
-        if (! isConfigured()) {
+
+        if (!isConfigured()) {
             PropertyConfigurator.configure(cli.getClass().getResourceAsStream("/log4j.properties"));
         }
 
@@ -171,15 +171,28 @@ public class TikaCLI {
         else {
             Enumeration loggers = LogManager.getCurrentLoggers() ;
             while (loggers.hasMoreElements()) {
-                Logger c = (Logger) loggers.nextElement();
+                org.apache.log4j.Logger c = (org.apache.log4j.Logger) loggers.nextElement();
                 if (c.getAllAppenders().hasMoreElements())
                     return true;
             }
         }
         return false;
     }
-    private class OutputType {
 
+    private void extractInlineImagesFromPDFs() {
+        if (configFilePath == null && context.get(PDFParserConfig.class) == null) {
+            PDFParserConfig pdfParserConfig = new PDFParserConfig();
+            pdfParserConfig.setExtractInlineImages(true);
+            String warn = "As a convenience, TikaCLI has turned on extraction of\n" +
+                    "inline images for the PDFParser (TIKA-2374).\n" +
+                    "Aside from the -z option, this is not the default behavior\n"+
+                    "in Tika generally or in tika-server.";
+            LOG.info(warn);
+            context.set(PDFParserConfig.class, pdfParserConfig);
+        }
+    }
+
+    private class OutputType {
         public void process(
                 InputStream input, OutputStream output, Metadata metadata)
                 throws Exception {
@@ -188,6 +201,7 @@ public class TikaCLI {
                 p = new ForkParser(TikaCLI.class.getClassLoader(), p);
             }
             ContentHandler handler = getContentHandler(output, metadata);
+
             p.parse(input, handler, metadata, context);
             // fix for TIKA-596: if a parser doesn't generate
             // XHTML output, the lack of an output document prevents
@@ -283,7 +297,7 @@ public class TikaCLI {
                 OutputStream output, Metadata metadata) throws Exception {
             final PrintWriter writer =
                 new PrintWriter(getOutputWriter(output, encoding));
-            return new ProfilingHandler() {
+            return new LanguageHandler() {
                 public void endDocument() {
                     writer.println(getLanguage().getLanguage());
                     writer.flush();
@@ -305,22 +319,6 @@ public class TikaCLI {
     };
     
     
-    /* Creates ngram profile */
-    private final OutputType CREATE_PROFILE = new OutputType() {
-        @Override
-        public void process(
-                InputStream stream, OutputStream output, Metadata metadata)
-                throws Exception {
-            ngp = LanguageProfilerBuilder.create(profileName, stream, encoding);
-            FileOutputStream fos = new FileOutputStream(new File(profileName + ".ngp"));
-            ngp.save(fos);//saves ngram profile
-            fos.close();
-            PrintWriter writer = new PrintWriter(getOutputWriter(output, encoding));
-            writer.println("ngram profile location:=" + new File(ngp.getName()).getCanonicalPath());
-            writer.flush();
-        }
-    };
-
     private ParseContext context;
     
     private Detector detector;
@@ -334,9 +332,9 @@ public class TikaCLI {
     private OutputType type = XML;
 
     private boolean recursiveJSON = false;
-    
-    private LanguageProfilerBuilder ngp = null;
 
+    private URI networkURI = null;
+    
     /**
      * Output character encoding, or <code>null</code> for platform default
      */
@@ -355,21 +353,7 @@ public class TikaCLI {
 
     private boolean fork = false;
 
-    private String profileName = null;
-
     private boolean prettyPrint;
-    
-    public TikaCLI() throws Exception {
-        context = new ParseContext();
-        detector = new DefaultDetector();
-        parser = new AutoDetectParser(detector);
-        context.set(Parser.class, parser);
-        context.set(PasswordProvider.class, new PasswordProvider() {
-            public String getPassword(Metadata metadata) {
-                return password;
-            }
-        });
-    }
 
     public void process(String arg) throws Exception {
         if (arg.equals("-?") || arg.equals("--help")) {
@@ -379,7 +363,7 @@ public class TikaCLI {
             pipeMode = false;
             version();
         } else if (arg.equals("-v") || arg.equals("--verbose")) {
-            Logger.getRootLogger().setLevel(Level.DEBUG);
+            org.apache.log4j.Logger.getRootLogger().setLevel(Level.DEBUG);
         } else if (arg.equals("-g") || arg.equals("--gui")) {
             pipeMode = false;
             if (configFilePath != null){
@@ -417,18 +401,19 @@ public class TikaCLI {
         } else if (arg.equals("--dump-static-config")) {
             pipeMode = false;
             dumpConfig(TikaConfigSerializer.Mode.STATIC);
+        } else if (arg.equals("--dump-static-full-config")) {
+            pipeMode = false;
+            dumpConfig(TikaConfigSerializer.Mode.STATIC_FULL);
         } else if (arg.equals("--container-aware")
                 || arg.equals("--container-aware-detector")) {
             // ignore, as container-aware detectors are now always used
         } else if (arg.equals("-f") || arg.equals("--fork")) {
             fork = true;
         } else if (arg.startsWith("--config=")) {
-            configure(arg.substring("--config=".length()));
+            configFilePath = arg.substring("--config=".length());
         } else if (arg.startsWith("--digest=")) {
-            CommonsDigester.DigestAlgorithm[] algos = CommonsDigester.parse(
+            digester = new CommonsDigester(MAX_MARK,
                     arg.substring("--digest=".length()));
-            digester = new CommonsDigester(MAX_MARK,algos);
-            parser = new DigestingParser(parser, digester);
         } else if (arg.startsWith("-e")) {
             encoding = arg.substring("-e".length());
         } else if (arg.startsWith("--encoding=")) {
@@ -460,6 +445,7 @@ public class TikaCLI {
         } else if (arg.startsWith("--extract-dir=")) {
             extractDir = new File(arg.substring("--extract-dir=".length()));
         } else if (arg.equals("-z") || arg.equals("--extract")) {
+            extractInlineImagesFromPDFs();
             type = NO_OUTPUT;
             context.set(EmbeddedDocumentExtractor.class, new FileEmbeddedDocumentExtractor());
         } else if (arg.equals("-r") || arg.equals("--pretty-print")) {
@@ -469,16 +455,13 @@ public class TikaCLI {
             serverMode = true;
             pipeMode = false;
         } else if (arg.startsWith("-c")) {
-            URI uri = new URI(arg.substring("-c".length()));
-            parser = new NetworkParser(uri);
+            networkURI = new URI(arg.substring("-c".length()));
         } else if (arg.startsWith("--client=")) {
-            URI uri = new URI(arg.substring("--client=".length()));
-            parser = new NetworkParser(uri);
-        } else if(arg.startsWith("--create-profile=")){
-            profileName = arg.substring("--create-profile=".length());
-            type = CREATE_PROFILE;
+            networkURI = new URI(arg.substring("-c".length()));
         } else {
             pipeMode = false;
+            configure();
+            
             if (serverMode) {
                 new TikaServer(Integer.parseInt(arg)).start();
             } else if (arg.equals("-")) {
@@ -510,6 +493,7 @@ public class TikaCLI {
     }
 
     private void dumpConfig(TikaConfigSerializer.Mode mode) throws Exception {
+        configure();
         TikaConfig localConfig = (config == null) ? TikaConfig.getDefaultConfig() : config;
 
         TikaConfigSerializer.serialize(localConfig, mode,
@@ -564,6 +548,7 @@ public class TikaCLI {
         out.println("    --dump-minimal-config  Print minimal TikaConfig");
         out.println("    --dump-current-config  Print current TikaConfig");
         out.println("    --dump-static-config   Print static config");
+        out.println("    --dump-static-full-config  Print static explicit config");
         out.println("");
         out.println("    -x  or --xml           Output XHTML content (default)");
         out.println("    -h  or --html          Output HTML content");
@@ -586,8 +571,6 @@ public class TikaCLI {
         out.println("    -r  or --pretty-print  For JSON, XML and XHTML outputs, adds newlines and");
         out.println("                           whitespace, for better readability");
         out.println();
-        out.println("    --create-profile=X");
-        out.println("         Create NGram profile, where X is a profile name");
         out.println("    --list-parsers");
         out.println("         List the available document parsers");
         out.println("    --list-parser-details");
@@ -692,16 +675,30 @@ public class TikaCLI {
     }
 
 
+    private void configure() throws TikaException, IOException, SAXException {
 
-    private void configure(String configFilePath) throws Exception {
-        this.configFilePath = configFilePath;
-        config = new TikaConfig(new File(configFilePath));
-        parser = new AutoDetectParser(config);
-        if (digester != null) {
-            parser = new DigestingParser(parser, digester);
+        if (networkURI != null) {
+            parser = new NetworkParser(networkURI);
+            config = TikaConfig.getDefaultConfig();
+        } else {
+            if (configFilePath != null) {
+                config = new TikaConfig(new File(configFilePath));
+            } else {
+                config = TikaConfig.getDefaultConfig();
+            }
+
+            parser = new AutoDetectParser(config);
+            if (digester != null) {
+                parser = new DigestingParser(parser, digester);
+            }
         }
         detector = config.getDetector();
         context.set(Parser.class, parser);
+        context.set(PasswordProvider.class, new PasswordProvider() {
+            public String getPassword(Metadata metadata) {
+                return password;
+            }
+        });
     }
 
     private void displayMetModels(){
@@ -735,7 +732,8 @@ public class TikaCLI {
      * If a parser is a composite parser, it will list the
      * sub parsers and their mime-types.
      */
-    private void displayParsers(boolean includeMimeTypes, boolean aptListFormat) {
+    private void displayParsers(boolean includeMimeTypes, boolean aptListFormat) throws TikaException, IOException, SAXException {
+        configure();
         displayParser(parser, includeMimeTypes, aptListFormat, 3);
     }
      
@@ -779,7 +777,8 @@ public class TikaCLI {
      * If a detector is a composite detector, it will list the
      *  sub detectors.
      */
-    private void displayDetectors() {
+    private void displayDetectors() throws TikaException, IOException, SAXException {
+        configure();
         displayDetector(detector, 0);
     }
      
@@ -1092,8 +1091,7 @@ public class TikaCLI {
                     name,
                     e.getMessage()
                 );
-                System.err.println(msg);
-                logger.warn(msg, e);
+                LOG.warn(msg, e);
             }
         }
 
@@ -1118,14 +1116,21 @@ public class TikaCLI {
     private class TikaServer extends Thread {
 
         private final ServerSocket server;
-
+        private final int port;
         public TikaServer(int port) throws IOException {
             super("Tika server at port " + port);
             server = new ServerSocket(port);
+            this.port = port;
         }
 
         @Override
         public void run() {
+            System.out.println("Successfully started tika-app's server on port: "+port);
+            System.err.println("WARNING: The server option in tika-app is deprecated and will be removed ");
+            System.err.println("by Tika 2.0 if not shortly after Tika 1.14.");
+            System.err.println("Please migrate to the JAX-RS tika-server package.");
+            System.err.println("See https://wiki.apache.org/tika/TikaJAXRS for usage.");
+
             try {
                 try {
                     while (true) {
@@ -1259,4 +1264,6 @@ public class TikaCLI {
             }
         }        
     }
+
+
 }

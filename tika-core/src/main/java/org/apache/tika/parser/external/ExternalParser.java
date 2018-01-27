@@ -24,6 +24,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.Reader;
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
@@ -48,20 +49,45 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
  * Parser that uses an external program (like catdoc or pdf2txt) to extract
- *  text content and metadata from a given document.
+ * text content and metadata from a given document.
  */
 public class ExternalParser extends AbstractParser {
+
+    /**
+     * Consumer contract
+     *
+     * @since Apache Tika 1.14
+     */
+    public interface LineConsumer extends Serializable {
+        /**
+         * Consume a line
+         *
+         * @param line a line of string
+         */
+        void consume(String line);
+
+        /**
+         * A null consumer
+         */
+        LineConsumer NULL = new LineConsumer() {
+            @Override
+            public void consume(String line) {
+                // ignores
+            }
+        };
+    }
+
     private static final long serialVersionUID = -1079128990650687037L;
-    
+
     /**
      * The token, which if present in the Command string, will
-     *  be replaced with the input filename. 
+     * be replaced with the input filename.
      * Alternately, the input data can be streamed over STDIN.
      */
     public static final String INPUT_FILE_TOKEN = "${INPUT}";
     /**
      * The token, which if present in the Command string, will
-     *  be replaced with the output filename. 
+     * be replaced with the output filename.
      * Alternately, the output data can be collected on STDOUT.
      */
     public static final String OUTPUT_FILE_TOKEN = "${OUTPUT}";
@@ -70,18 +96,24 @@ public class ExternalParser extends AbstractParser {
      * Media types supported by the external program.
      */
     private Set<MediaType> supportedTypes = Collections.emptySet();
-    
+
     /**
      * Regular Expressions to run over STDOUT to
-     *  extract Metadata.
+     * extract Metadata.
      */
-    private Map<Pattern,String> metadataPatterns = null;
+    private Map<Pattern, String> metadataPatterns = null;
 
     /**
      * The external command to invoke.
+     *
      * @see Runtime#exec(String[])
      */
-    private String[] command = new String[] { "cat" };
+    private String[] command = new String[]{"cat"};
+
+    /**
+     * A consumer for ignored Lines
+     */
+    private LineConsumer ignoredLineConsumer = LineConsumer.NULL;
 
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return getSupportedTypes();
@@ -93,7 +125,7 @@ public class ExternalParser extends AbstractParser {
 
     public void setSupportedTypes(Set<MediaType> supportedTypes) {
         this.supportedTypes =
-            Collections.unmodifiableSet(new HashSet<MediaType>(supportedTypes));
+                Collections.unmodifiableSet(new HashSet<MediaType>(supportedTypes));
     }
 
 
@@ -103,42 +135,60 @@ public class ExternalParser extends AbstractParser {
 
     /**
      * Sets the command to be run. This can include either of
-     *  {@link #INPUT_FILE_TOKEN} or {@link #OUTPUT_FILE_TOKEN}
-     *  if the command needs filenames.
+     * {@link #INPUT_FILE_TOKEN} or {@link #OUTPUT_FILE_TOKEN}
+     * if the command needs filenames.
+     *
      * @see Runtime#exec(String[])
      */
     public void setCommand(String... command) {
         this.command = command;
     }
-    
-    
-    public Map<Pattern,String> getMetadataExtractionPatterns() {
-       return metadataPatterns;
+
+    /**
+     * Gets lines consumer
+     *
+     * @return consumer instance
+     */
+    public LineConsumer getIgnoredLineConsumer() {
+        return ignoredLineConsumer;
     }
-    
+
+    /**
+     * Set a consumer for the lines ignored by the parse functions
+     *
+     * @param ignoredLineConsumer consumer instance
+     */
+    public void setIgnoredLineConsumer(LineConsumer ignoredLineConsumer) {
+        this.ignoredLineConsumer = ignoredLineConsumer;
+    }
+
+    public Map<Pattern, String> getMetadataExtractionPatterns() {
+        return metadataPatterns;
+    }
+
     /**
      * Sets the map of regular expression patterns and Metadata
-     *  keys. Any matching patterns will have the matching
-     *  metadata entries set.
+     * keys. Any matching patterns will have the matching
+     * metadata entries set.
      * Set this to null to disable Metadata extraction.
      */
-    public void setMetadataExtractionPatterns(Map<Pattern,String> patterns) {
-       this.metadataPatterns = patterns;
+    public void setMetadataExtractionPatterns(Map<Pattern, String> patterns) {
+        this.metadataPatterns = patterns;
     }
-    
+
 
     /**
      * Executes the configured external command and passes the given document
-     *  stream as a simple XHTML document to the given SAX content handler.
+     * stream as a simple XHTML document to the given SAX content handler.
      * Metadata is only extracted if {@link #setMetadataExtractionPatterns(Map)}
-     *  has been called to set patterns.
+     * has been called to set patterns.
      */
     public void parse(
             InputStream stream, ContentHandler handler,
             Metadata metadata, ParseContext context)
             throws IOException, SAXException, TikaException {
         XHTMLContentHandler xhtml =
-            new XHTMLContentHandler(handler, metadata);
+                new XHTMLContentHandler(handler, metadata);
 
         TemporaryResources tmp = new TemporaryResources();
         try {
@@ -160,58 +210,63 @@ public class ExternalParser extends AbstractParser {
         File output = null;
 
         // Build our command
-        String[] cmd = command[0].split(" ");
-        for(int i=0; i<cmd.length; i++) {
-           if(cmd[i].indexOf(INPUT_FILE_TOKEN) != -1) {
-              cmd[i] = cmd[i].replace(INPUT_FILE_TOKEN, stream.getFile().getPath());
-              inputToStdIn = false;
-           }
-           if(cmd[i].indexOf(OUTPUT_FILE_TOKEN) != -1) {
-              output = tmp.createTemporaryFile();
-              outputFromStdOut = false;
-              cmd[i] = cmd[i].replace(OUTPUT_FILE_TOKEN, output.getPath());
-           }
+        String[] cmd;
+        if (command.length == 1) {
+            cmd = command[0].split(" ");
+        } else {
+            cmd = new String[command.length];
+            System.arraycopy(command, 0, cmd, 0, command.length);
+        }
+        for (int i = 0; i < cmd.length; i++) {
+            if (cmd[i].indexOf(INPUT_FILE_TOKEN) != -1) {
+                cmd[i] = cmd[i].replace(INPUT_FILE_TOKEN, stream.getFile().getPath());
+                inputToStdIn = false;
+            }
+            if (cmd[i].indexOf(OUTPUT_FILE_TOKEN) != -1) {
+                output = tmp.createTemporaryFile();
+                outputFromStdOut = false;
+                cmd[i] = cmd[i].replace(OUTPUT_FILE_TOKEN, output.getPath());
+            }
         }
 
         // Execute
         Process process = null;
-      try{
-        if(cmd.length == 1) {
-           process = Runtime.getRuntime().exec( cmd[0] );
-        } else {
-           process = Runtime.getRuntime().exec( cmd );
+        try {
+            if (cmd.length == 1) {
+                process = Runtime.getRuntime().exec(cmd[0]);
+            } else {
+                process = Runtime.getRuntime().exec(cmd);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
         }
-      }
-      catch(Exception e){
-    	  e.printStackTrace();
-      }
 
         try {
-            if(inputToStdIn) {
-               sendInput(process, stream);
+            if (inputToStdIn) {
+                sendInput(process, stream);
             } else {
-               process.getOutputStream().close();
+                process.getOutputStream().close();
             }
 
             InputStream out = process.getInputStream();
             InputStream err = process.getErrorStream();
-            
-            if(hasPatterns) {
-               extractMetadata(err, metadata);
-               
-               if(outputFromStdOut) {
-                  extractOutput(out, xhtml);
-               } else {
-                  extractMetadata(out, metadata);
-               }
+
+            if (hasPatterns) {
+                extractMetadata(err, metadata);
+
+                if (outputFromStdOut) {
+                    extractOutput(out, xhtml);
+                } else {
+                    extractMetadata(out, metadata);
+                }
             } else {
-               ignoreStream(err);
-               
-               if(outputFromStdOut) {
-                  extractOutput(out, xhtml);
-               } else {
-                  ignoreStream(out);
-               }
+                ignoreStream(err);
+
+                if (outputFromStdOut) {
+                    extractOutput(out, xhtml);
+                } else {
+                    ignoreStream(out);
+                }
             }
         } finally {
             try {
@@ -232,9 +287,9 @@ public class ExternalParser extends AbstractParser {
      * The standard output stream is closed once fully processed.
      *
      * @param process process
-     * @param xhtml XHTML content handler
+     * @param xhtml   XHTML content handler
      * @throws SAXException if the XHTML SAX events could not be handled
-     * @throws IOException if an input error occurred
+     * @throws IOException  if an input error occurred
      */
     private void extractOutput(InputStream stream, XHTMLContentHandler xhtml)
             throws SAXException, IOException {
@@ -258,7 +313,7 @@ public class ExternalParser extends AbstractParser {
      * closed by this method.
      *
      * @param process process
-     * @param stream input stream
+     * @param stream  input stream
      */
     private void sendInput(final Process process, final InputStream stream) {
         Thread t = new Thread() {
@@ -271,10 +326,23 @@ public class ExternalParser extends AbstractParser {
             }
         };
         t.start();
-        try{
-     	   t.join();
+        try {
+            t.join();
+        } catch (InterruptedException ignore) {
         }
-        catch(InterruptedException ignore){}        
+    }
+
+
+    /**
+     * Starts a thread that reads and discards the contents of the
+     * standard stream of the given process. Potential exceptions
+     * are ignored, and the stream is closed once fully processed.
+     * Note: calling this starts a new thread and blocks the current(caller) thread until the new thread dies
+     *
+     * @param stream stream to be ignored
+     */
+    private static void ignoreStream(final InputStream stream) {
+        ignoreStream(stream, true);
     }
 
     /**
@@ -282,9 +350,11 @@ public class ExternalParser extends AbstractParser {
      * standard stream of the given process. Potential exceptions
      * are ignored, and the stream is closed once fully processed.
      *
-     * @param process process
+     * @param stream       stream to sent to black hole (a k a null)
+     * @param waitForDeath when {@code true} the caller thread will be blocked till the death of new thread.
+     * @return The thread that is created and started
      */
-    private void ignoreStream(final InputStream stream) {
+    private static Thread ignoreStream(final InputStream stream, boolean waitForDeath) {
         Thread t = new Thread() {
             public void run() {
                 try {
@@ -296,91 +366,102 @@ public class ExternalParser extends AbstractParser {
             }
         };
         t.start();
-        try{
-     	   t.join();
-        }
-        catch(InterruptedException ignore){}
-    }
-    
-    private void extractMetadata(final InputStream stream, final Metadata metadata) {
-       Thread t = new Thread() {
-          public void run() {
-             BufferedReader reader;
-              reader = new BufferedReader(new InputStreamReader(stream, UTF_8));
-             try {
-                String line;
-                while ( (line = reader.readLine()) != null ) {
-                   for(Pattern p : metadataPatterns.keySet()) {
-                      Matcher m = p.matcher(line);
-                      if(m.find()) {
-                    	 if (metadataPatterns.get(p) != null && 
-                    			 !metadataPatterns.get(p).equals("")){
-                                   metadata.add( metadataPatterns.get(p), m.group(1) );
-                    	 }
-                    	 else{
-                    		 metadata.add( m.group(1), m.group(2));
-                    	 }
-                      }
-                   }
-                }
-             } catch (IOException e) {
-                 // Ignore
-             } finally {
-                IOUtils.closeQuietly(reader);
-                IOUtils.closeQuietly(stream);
+        if (waitForDeath) {
+            try {
+                t.join();
+            } catch (InterruptedException ignore) {
             }
-          }
-       };
-	   t.start();
-       try{
-    	   t.join();
-       }
-       catch(InterruptedException ignore){}
+        }
+        return t;
     }
-    
+
+    private void extractMetadata(final InputStream stream, final Metadata metadata) {
+        Thread t = new Thread() {
+            public void run() {
+                BufferedReader reader;
+                reader = new BufferedReader(new InputStreamReader(stream, UTF_8));
+                try {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        boolean consumed = false;
+                        for (Pattern p : metadataPatterns.keySet()) {
+                            Matcher m = p.matcher(line);
+                            if (m.find()) {
+                                consumed = true;
+                                if (metadataPatterns.get(p) != null &&
+                                        !metadataPatterns.get(p).equals("")) {
+                                    metadata.add(metadataPatterns.get(p), m.group(1));
+                                } else {
+                                    metadata.add(m.group(1), m.group(2));
+                                }
+                            }
+                        }
+                        if (!consumed) {
+                            ignoredLineConsumer.consume(line);
+                        }
+                    }
+                } catch (IOException e) {
+                    // Ignore
+                } finally {
+                    IOUtils.closeQuietly(reader);
+                    IOUtils.closeQuietly(stream);
+                }
+            }
+        };
+        t.start();
+        try {
+            t.join();
+        } catch (InterruptedException ignore) {
+        }
+    }
+
     /**
      * Checks to see if the command can be run. Typically used with
-     *  something like "myapp --version" to check to see if "myapp"
-     *  is installed and on the path.
-     *  
-     * @param checkCmd The check command to run
-     * @param errorValue What is considered an error value? 
+     * something like "myapp --version" to check to see if "myapp"
+     * is installed and on the path.
+     *
+     * @param checkCmd   The check command to run
+     * @param errorValue What is considered an error value?
      */
     public static boolean check(String checkCmd, int... errorValue) {
-       return check(new String[] {checkCmd}, errorValue);
+        return check(new String[]{checkCmd}, errorValue);
     }
 
     public static boolean check(String[] checkCmd, int... errorValue) {
-       if(errorValue.length == 0) {
-          errorValue = new int[] { 127 };
-       }
-       
-       try {
-          Process process= Runtime.getRuntime().exec(checkCmd);
-          int result = process.waitFor(); 
-          for(int err : errorValue) {
-             if(result == err) return false;
-          }
-          return true;
-       } catch(IOException e) {
-          // Some problem, command is there or is broken
-          return false;
-       } catch (InterruptedException ie) {
-          // Some problem, command is there or is broken
-          return false;
-       } catch (SecurityException se) {
-          // External process execution is banned by the security manager
-          return false;
-       } catch (Error err) {
-           if (err.getMessage() != null && 
-               (err.getMessage().contains("posix_spawn") || 
-               err.getMessage().contains("UNIXProcess"))) {
-               //"Error forking command due to JVM locale bug 
-               //(see TIKA-1526 and SOLR-6387)"
-               return false;
-           }
-           //throw if a different kind of error
-           throw err;
-       }
+        if (errorValue.length == 0) {
+            errorValue = new int[]{127};
+        }
+
+        try {
+            Process process = Runtime.getRuntime().exec(checkCmd);
+            Thread stdErrSuckerThread = ignoreStream(process.getErrorStream(), false);
+            Thread stdOutSuckerThread = ignoreStream(process.getInputStream(), false);
+            stdErrSuckerThread.join();
+            stdOutSuckerThread.join();
+            int result = process.waitFor();
+            for (int err : errorValue) {
+                if (result == err) return false;
+            }
+            return true;
+        } catch (IOException e) {
+            // Some problem, command is there or is broken
+            return false;
+        } catch (InterruptedException ie) {
+            // Some problem, command is there or is broken
+            return false;
+        } catch (SecurityException se) {
+            // External process execution is banned by the security manager
+            return false;
+        } catch (Error err) {
+            if (err.getMessage() != null &&
+                    (err.getMessage().contains("posix_spawn") ||
+                            err.getMessage().contains("UNIXProcess"))) {
+                //"Error forking command due to JVM locale bug
+                //(see TIKA-1526 and SOLR-6387)"
+                return false;
+            }
+            //throw if a different kind of error
+            throw err;
+        }
     }
 }

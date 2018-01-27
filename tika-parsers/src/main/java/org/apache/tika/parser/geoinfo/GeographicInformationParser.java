@@ -17,6 +17,16 @@
 
 package org.apache.tika.parser.geoinfo;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Locale;
+import java.util.Set;
+
 import org.apache.sis.internal.util.CheckedArrayList;
 import org.apache.sis.internal.util.CheckedHashSet;
 import org.apache.sis.metadata.iso.DefaultMetadata;
@@ -55,17 +65,16 @@ import org.opengis.metadata.identification.Keywords;
 import org.opengis.metadata.identification.Progress;
 import org.opengis.metadata.identification.TopicCategory;
 import org.opengis.util.InternationalString;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.Charset;
-import java.util.*;
-
 
 public class GeographicInformationParser extends AbstractParser{
+
+    private static final Logger LOG = LoggerFactory.getLogger(GeographicInformationParser.class);
+
 
     public static final String geoInfoType="text/iso19139+xml";
     private final Set<MediaType> SUPPORTED_TYPES =
@@ -84,39 +93,39 @@ public class GeographicInformationParser extends AbstractParser{
         DefaultMetadata defaultMetadata=null;
         XHTMLContentHandler xhtmlContentHandler=new XHTMLContentHandler(contentHandler,metadata);
 
+        TemporaryResources tmp = TikaInputStream.isTikaInputStream(inputStream) ? null
+                : new TemporaryResources();
         try {
-            TemporaryResources tmp = new TemporaryResources();
-            TikaInputStream tikaInputStream=TikaInputStream.get(inputStream,tmp);
+            TikaInputStream tikaInputStream = TikaInputStream.get(inputStream,tmp);
             File file= tikaInputStream.getFile();
             dataStore = DataStores.open(file);
             defaultMetadata=new DefaultMetadata(dataStore.getMetadata());
             if(defaultMetadata!=null)
                 extract(xhtmlContentHandler, metadata, defaultMetadata);
 
-        }catch (UnsupportedStorageException e) {
+        } catch (UnsupportedStorageException e) {
             throw new TikaException("UnsupportedStorageException",e);
-        }
-        catch (DataStoreException e) {
-            throw new TikaException("DataStoreException",e);
+        } catch (DataStoreException e) {
+            throw new TikaException("DataStoreException", e);
+        } finally {
+            if (tmp != null) {
+                tmp.dispose();
+            }
         }
     }
 
-    private void extract(XHTMLContentHandler xhtmlContentHandler,Metadata metadata, DefaultMetadata defaultMetadata) throws SAXException{
-        try {
-            getMetaDataCharacterSet(metadata, defaultMetadata);
-            getMetaDataContact(metadata, defaultMetadata);
-            getMetaDataIdentificationInfo(metadata, defaultMetadata);
-            getMetaDataDistributionInfo(metadata, defaultMetadata);
-            getMetaDataDateInfo(metadata, defaultMetadata);
-            getMetaDataResourceScope(metadata, defaultMetadata);
-            getMetaDataParentMetaDataTitle(metadata, defaultMetadata);
-            getMetaDataIdetifierCode(metadata, defaultMetadata);
-            getMetaDataStandard(metadata, defaultMetadata);
-            extractContent(xhtmlContentHandler, defaultMetadata);
-        }
-        catch(Exception e){
-            e.printStackTrace();
-        }
+    private void extract(XHTMLContentHandler xhtmlContentHandler, Metadata metadata,
+                         DefaultMetadata defaultMetadata) throws SAXException {
+        getMetaDataCharacterSet(metadata, defaultMetadata);
+        getMetaDataContact(metadata, defaultMetadata);
+        getMetaDataIdentificationInfo(metadata, defaultMetadata);
+        getMetaDataDistributionInfo(metadata, defaultMetadata);
+        getMetaDataDateInfo(metadata, defaultMetadata);
+        getMetaDataResourceScope(metadata, defaultMetadata);
+        getMetaDataParentMetaDataTitle(metadata, defaultMetadata);
+        getMetaDataIdetifierCode(metadata, defaultMetadata);
+        getMetaDataStandard(metadata, defaultMetadata);
+        extractContent(xhtmlContentHandler, defaultMetadata);
     }
 
     private void extractContent(XHTMLContentHandler xhtmlContentHandler, DefaultMetadata defaultMetadata) throws SAXException{

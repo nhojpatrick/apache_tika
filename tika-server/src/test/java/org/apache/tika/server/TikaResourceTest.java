@@ -18,10 +18,10 @@
 package org.apache.tika.server;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import javax.ws.rs.core.Response;
-
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,14 +30,17 @@ import org.apache.cxf.jaxrs.JAXRSServerFactoryBean;
 import org.apache.cxf.jaxrs.client.WebClient;
 import org.apache.cxf.jaxrs.ext.multipart.Attachment;
 import org.apache.cxf.jaxrs.lifecycle.SingletonResourceProvider;
+import org.apache.tika.parser.ocr.TesseractOCRConfig;
+import org.apache.tika.parser.ocr.TesseractOCRParser;
 import org.apache.tika.server.resource.TikaResource;
 import org.junit.Test;
 
 public class TikaResourceTest extends CXFTestBase {
     public static final String TEST_DOC = "test.doc";
-    public static final String TEST_XLSX = "16637.xlsx";
     public static final String TEST_PASSWORD_PROTECTED = "password.xls";
     private static final String TEST_RECURSIVE_DOC = "test_recursive_embedded.docx";
+
+    private static final String STREAM_CLOSED_FAULT = "java.io.IOException: Stream Closed";
 
     private static final String TIKA_PATH = "/tika";
     private static final int UNPROCESSEABLE = 422;
@@ -76,6 +79,35 @@ public class TikaResourceTest extends CXFTestBase {
     }
 
     @Test
+    public void testTextMain() throws Exception {
+        //boilerpipe
+        Response response = WebClient.create(endPoint + TIKA_PATH + "/main")
+                .accept("text/plain")
+                .put(ClassLoader.getSystemResourceAsStream("testHTML.html"));
+        String responseMsg = getStringFromInputStream((InputStream) response
+                .getEntity());
+        assertTrue(responseMsg.contains("Title : Test Indexation Html"));
+        assertFalse(responseMsg.contains("Indexation du fichier"));
+    }
+
+    @Test
+    public void testTextMainMultipart() throws Exception {
+        //boilerpipe
+        Attachment attachmentPart =
+                new Attachment("myhtml", "text/html", ClassLoader.getSystemResourceAsStream("testHTML.html"));
+
+
+        Response response = WebClient.create(endPoint + TIKA_PATH+"/form/main")
+                .type("multipart/form-data")
+                .accept("text/plain")
+                .post(attachmentPart);
+        String responseMsg = getStringFromInputStream((InputStream) response
+                .getEntity());
+        assertTrue(responseMsg.contains("Title : Test Indexation Html"));
+        assertFalse(responseMsg.contains("Indexation du fichier"));
+    }
+
+    @Test
     public void testApplicationWadl() throws Exception {
         Response response = WebClient
                 .create(endPoint + TIKA_PATH + "?_wadl")
@@ -105,6 +137,8 @@ public class TikaResourceTest extends CXFTestBase {
                 .getEntity());
         assertTrue(responseMsg.contains("test"));
         assertContains("<meta name=\"X-TIKA:digest:MD5\" content=\"f8be45c34e8919eedba48cc8d207fbf0\"/>",
+                responseMsg);
+        assertContains("<meta name=\"X-TIKA:digest:SHA1\" content=\"N4EBCE7EGTIGZWETEJ6WD3W4KN32TLPG\"/>",
                 responseMsg);
     }
 
@@ -190,4 +224,59 @@ public class TikaResourceTest extends CXFTestBase {
         assertTrue(responseMsg.contains("Example text"));
     }
 
+    //TIKA-2290
+    @Test
+    public void testPDFOCRConfig() throws Exception {
+        if (! new TesseractOCRParser().hasTesseract(new TesseractOCRConfig())) {
+            return;
+        }
+
+        Response response = WebClient.create(endPoint + TIKA_PATH)
+                .type("application/pdf")
+                .accept("text/plain")
+                .header(TikaResource.X_TIKA_PDF_HEADER_PREFIX+"OcrStrategy", "no_ocr")
+                .put(ClassLoader.getSystemResourceAsStream("testOCR.pdf"));
+        String responseMsg = getStringFromInputStream((InputStream) response
+                .getEntity());
+        assertTrue(responseMsg.trim().equals(""));
+
+        response = WebClient.create(endPoint + TIKA_PATH)
+                .type("application/pdf")
+                .accept("text/plain")
+                .header(TikaResource.X_TIKA_PDF_HEADER_PREFIX+"OcrStrategy", "ocr_only")
+                .put(ClassLoader.getSystemResourceAsStream("testOCR.pdf"));
+        responseMsg = getStringFromInputStream((InputStream) response
+                .getEntity());
+        assertContains("Happy New Year 2003!", responseMsg);
+
+        //now try a bad value
+        response = WebClient.create(endPoint + TIKA_PATH)
+                .type("application/pdf")
+                .accept("text/plain")
+                .header(TikaResource.X_TIKA_PDF_HEADER_PREFIX + "OcrStrategy", "non-sense-value")
+                .put(ClassLoader.getSystemResourceAsStream("testOCR.pdf"));
+        assertEquals(500, response.getStatus());
+    }
+
+    @Test
+    public void testExtractTextAcceptPlainText() throws Exception {
+        //TIKA-2384
+        Attachment attachmentPart = new Attachment(
+                "my-docx-file",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ClassLoader.getSystemResourceAsStream("2pic.docx")
+        );
+
+        Response response = WebClient.create(endPoint + TIKA_PATH + "/form")
+                .type("multipart/form-data")
+                .accept("text/plain")
+                .post(attachmentPart);
+
+        String responseMsg = getStringFromInputStream((InputStream) response.getEntity());
+        assertTrue(responseMsg.contains("P1040893.JPG"));
+        assertNotFound(
+                STREAM_CLOSED_FAULT,
+                responseMsg
+        );
+    }
 }

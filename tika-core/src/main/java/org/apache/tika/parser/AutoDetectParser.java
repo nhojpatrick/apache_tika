@@ -23,6 +23,9 @@ import org.apache.tika.config.TikaConfig;
 import org.apache.tika.detect.DefaultDetector;
 import org.apache.tika.detect.Detector;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.exception.ZeroByteFileException;
+import org.apache.tika.extractor.EmbeddedDocumentExtractor;
+import org.apache.tika.extractor.ParsingEmbeddedDocumentExtractor;
 import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
@@ -36,6 +39,7 @@ public class AutoDetectParser extends CompositeParser {
 
     /** Serial version UID */
     private static final long serialVersionUID = 6110455808615143122L;
+    //private final TikaConfig config;
 
     /**
      * The type detector used by this parser to auto-detect the type
@@ -111,10 +115,29 @@ public class AutoDetectParser extends CompositeParser {
             // Automatically detect the MIME type of the document
             MediaType type = detector.detect(tis, metadata);
             metadata.set(Metadata.CONTENT_TYPE, type.toString());
-
+            //check for zero-byte inputstream
+            if (tis.getOpenContainer() == null) {
+                tis.mark(1);
+                if (tis.read() == -1) {
+                    throw new ZeroByteFileException("InputStream must have > 0 bytes");
+                }
+                tis.reset();
+            }
             // TIKA-216: Zip bomb prevention
             SecureContentHandler sch = 
                 handler != null ? new SecureContentHandler(handler, tis) : null;
+
+            //pass self to handle embedded documents if
+            //the caller hasn't specified one.
+            if (context.get(EmbeddedDocumentExtractor.class) == null) {
+                Parser p = context.get(Parser.class);
+                if (p == null) {
+                    context.set(Parser.class, this);
+                }
+                context.set(EmbeddedDocumentExtractor.class,
+                        new ParsingEmbeddedDocumentExtractor(context));
+            }
+
             try {
                 // Parse the document
                 super.parse(tis, sch, metadata, context);

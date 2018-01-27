@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.Charset;
 
+import org.apache.tika.config.Field;
 import org.apache.tika.detect.EncodingDetector;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
@@ -27,13 +28,19 @@ import org.apache.tika.utils.CharsetUtils;
 
 public class Icu4jEncodingDetector implements EncodingDetector {
 
+    @Field
+    private boolean stripMarkup = false;
+
+    @Field
+    private int markLimit = CharsetDetector.DEFAULT_MARK_LIMIT;
+
     public Charset detect(InputStream input, Metadata metadata)
             throws IOException {
         if (input == null) {
             return null;
         }
 
-        CharsetDetector detector = new CharsetDetector();
+        CharsetDetector detector = new CharsetDetector(markLimit);
 
         String incomingCharset = metadata.get(Metadata.CONTENT_ENCODING);
         String incomingType = metadata.get(Metadata.CONTENT_TYPE);
@@ -71,4 +78,38 @@ public class Icu4jEncodingDetector implements EncodingDetector {
         return null;
     }
 
+    /**
+     * Whether or not to attempt to strip html-ish markup
+     * from the stream before sending it to the underlying
+     * detector.
+     *
+     * The underlying detector may still apply its own stripping
+     * if this is set to <code>false</code>.
+     *
+     * @param stripMarkup whether or not to attempt to strip markup before
+     *                    sending the stream to the underlying detector
+     */
+    @Field
+    public void setStripMarkup(boolean stripMarkup) {
+        this.stripMarkup = stripMarkup;
+    }
+
+    public boolean getStripMarkup() {
+        return stripMarkup;
+    }
+
+    /**
+     * How far into the stream to read for charset detection.
+     * Default is 12000.
+     *
+     * @param markLimit
+     */
+    @Field
+    public void setMarkLimit(int markLimit) {
+        this.markLimit = markLimit;
+    }
+
+    public int getMarkLimit() {
+        return markLimit;
+    }
 }

@@ -16,6 +16,8 @@
  */
 package org.apache.tika.parser.chm.core;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -34,13 +36,18 @@ import org.apache.tika.parser.chm.assertion.ChmAssert;
 import org.apache.tika.parser.chm.core.ChmCommons.EntryType;
 import org.apache.tika.parser.chm.lzx.ChmBlockInfo;
 import org.apache.tika.parser.chm.lzx.ChmLzxBlock;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
+import org.apache.tika.parser.microsoft.ooxml.xwpf.XWPFEventBasedWordExtractor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Extracts text from chm file. Enumerates chm entries.
  */
 public class ChmExtractor {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ChmExtractor.class);
+
+
     private List<ChmLzxBlock> lzxBlocksCache = null;
     private ChmDirectoryListingSet chmDirList = null;
     private ChmItsfHeader chmItsfHeader = null;
@@ -51,6 +58,7 @@ public class ChmExtractor {
     private int indexOfContent;
     private long lzxBlockOffset;
     private long lzxBlockLength;
+    private ChmBlockInfo chmBlockInfo = null;//this will be instantiated at first call of
 
     /**
      * Returns lzxc control data.
@@ -216,7 +224,7 @@ public class ChmExtractor {
             setLzxBlocksCache(new ArrayList<ChmLzxBlock>());
 
         } catch (IOException e) {
-            e.printStackTrace();
+            LOG.warn("IOException parsing chm file", e);
         }
     }
 
@@ -259,9 +267,9 @@ public class ChmExtractor {
             } else if (directoryListingEntry.getEntryType() == EntryType.COMPRESSED
                     && !ChmCommons.hasSkip(directoryListingEntry)) {
                 /* Gets a chm hit_cache info */
-                ChmBlockInfo bb = ChmBlockInfo.getChmBlockInfoInstance(
+                chmBlockInfo = ChmBlockInfo.getChmBlockInfoInstance(
                         directoryListingEntry, (int) getChmLzxcResetTable()
-                                .getBlockLen(), getChmLzxcControlData());
+                                .getBlockLen(), getChmLzxcControlData(), chmBlockInfo);
 
                 int i = 0, start = 0, hit_cache = 0;
 
@@ -274,7 +282,7 @@ public class ChmExtractor {
                         for (i = 0; i < getLzxBlocksCache().size(); i++) {
                             //lzxBlock = getLzxBlocksCache().get(i);
                             int bn = getLzxBlocksCache().get(i).getBlockNumber();
-                            for (int j = bb.getIniBlock(); j <= bb.getStartBlock(); j++) {
+                            for (int j = chmBlockInfo.getIniBlock(); j <= chmBlockInfo.getStartBlock(); j++) {
                                 if (bn == j) {
                                     if (j > start) {
                                         start = j;
@@ -282,14 +290,14 @@ public class ChmExtractor {
                                     }
                                 }
                             }
-                            if (start == bb.getStartBlock())
+                            if (start == chmBlockInfo.getStartBlock())
                                 break;
                         }
                     }
 
 //                    if (i == getLzxBlocksCache().size() && i == 0) {
                     if (start<0) {
-                        start = bb.getIniBlock();
+                        start = chmBlockInfo.getIniBlock();
 
                         byte[] dataSegment = ChmCommons.getChmBlockSegment(
                                 getData(),
@@ -305,25 +313,25 @@ public class ChmExtractor {
                         lzxBlock = getLzxBlocksCache().get(hit_cache);
                     }
 
-                    for (i = start; i <= bb.getEndBlock();) {
-                        if (i == bb.getStartBlock() && i == bb.getEndBlock()) {
+                    for (i = start; i <= chmBlockInfo.getEndBlock();) {
+                        if (i == chmBlockInfo.getStartBlock() && i == chmBlockInfo.getEndBlock()) {
                             buffer.write(lzxBlock.getContent(
-                                    bb.getStartOffset(), bb.getEndOffset()));
+                                    chmBlockInfo.getStartOffset(), chmBlockInfo.getEndOffset()));
                             break;
                         }
 
-                        if (i == bb.getStartBlock()) {
+                        if (i == chmBlockInfo.getStartBlock()) {
                             buffer.write(lzxBlock.getContent(
-                                    bb.getStartOffset()));
+                                    chmBlockInfo.getStartOffset()));
                         }
 
-                        if (i > bb.getStartBlock() && i < bb.getEndBlock()) {
+                        if (i > chmBlockInfo.getStartBlock() && i < chmBlockInfo.getEndBlock()) {
                             buffer.write(lzxBlock.getContent());
                         }
 
-                        if (i == bb.getEndBlock()) {
+                        if (i == chmBlockInfo.getEndBlock()) {
                             buffer.write(lzxBlock.getContent(
-                                    0, bb.getEndOffset()));
+                                    0, chmBlockInfo.getEndOffset()));
                             break;
                         }
 

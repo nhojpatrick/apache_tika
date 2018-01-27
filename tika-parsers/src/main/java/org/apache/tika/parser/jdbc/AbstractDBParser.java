@@ -26,8 +26,6 @@ import java.util.Set;
 
 import org.apache.commons.io.IOExceptionWithCause;
 import org.apache.tika.exception.TikaException;
-import org.apache.tika.extractor.EmbeddedDocumentExtractor;
-import org.apache.tika.extractor.ParsingEmbeddedDocumentExtractor;
 import org.apache.tika.metadata.Database;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
@@ -46,11 +44,6 @@ abstract class AbstractDBParser extends AbstractParser {
 
     private Connection connection;
 
-    protected static EmbeddedDocumentExtractor getEmbeddedDocumentExtractor(ParseContext context) {
-        return context.get(EmbeddedDocumentExtractor.class,
-                new ParsingEmbeddedDocumentExtractor(context));
-    }
-
     @Override
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return null;
@@ -64,6 +57,11 @@ abstract class AbstractDBParser extends AbstractParser {
         try {
             tableNames = getTableNames(connection, metadata, context);
         } catch (SQLException e) {
+            try {
+                close();
+            } catch (SQLException sqlE) {
+                //swallow
+            }
             throw new IOExceptionWithCause(e);
         }
         for (String tableName : tableNames) {
@@ -94,13 +92,13 @@ abstract class AbstractDBParser extends AbstractParser {
                 xHandler.endElement("table");
             }
         } finally {
-            if (xHandler != null) {
-                xHandler.endDocument();
-            }
             try {
                 close();
-            } catch (SQLException e) {
+            } catch (IOException|SQLException e) {
                 //swallow
+            }
+            if (xHandler != null) {
+                xHandler.endDocument();
             }
         }
     }

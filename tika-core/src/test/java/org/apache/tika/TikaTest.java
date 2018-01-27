@@ -16,6 +16,7 @@
  */
 package org.apache.tika;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -40,9 +41,12 @@ import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.AutoDetectParser;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
+import org.apache.tika.parser.RecursiveParserWrapper;
+import org.apache.tika.sax.BasicContentHandlerFactory;
 import org.apache.tika.sax.BodyContentHandler;
 import org.apache.tika.sax.ToXMLContentHandler;
 import org.xml.sax.ContentHandler;
+import org.xml.sax.helpers.DefaultHandler;
 
 /**
  * Parent class of Tika tests
@@ -82,9 +86,22 @@ public abstract class TikaTest {
        return stream;
    }
 
-    public static void assertContains(String needle, String haystack) {
-       assertTrue(needle + " not found in:\n" + haystack, haystack.contains(needle));
+    public static void assertContainsCount(String needle, String haystack, int targetCount) {
+        int i = haystack.indexOf(needle);
+        int count = 0;
+        while (i > -1) {
+            count++;
+            i = haystack.indexOf(needle, i+1);
+        }
+        assertEquals("found "+count +" but should have found: "+targetCount,
+                targetCount, count);
     }
+
+
+    public static void assertContains(String needle, String haystack) {
+        assertTrue(needle + " not found in:\n" + haystack, haystack.contains(needle));
+    }
+
     public static <T> void assertContains(T needle, Collection<? extends T> haystack) {
         assertTrue(needle + " not found in:\n" + haystack, haystack.contains(needle));
     }
@@ -96,6 +113,44 @@ public abstract class TikaTest {
         assertFalse(needle + " unexpectedly found in:\n" + haystack, haystack.contains(needle));
     }
 
+    /**
+     * Test that in at least one item in metadataList, all keys and values
+     * in minExpected are contained.
+     * <p>
+     * The values in minExpected are tested for whether they are contained
+     * within a value in the target.  If minExpected=&dquot;text/vbasic&dquot;  and
+     * what was actually found in the target within metadatalist is
+     * &dquot;text/vbasic; charset=windows-1252&dquot;,
+     * that is counted as a hit.
+     *
+     * @param minExpected
+     * @param metadataList
+     */
+    public static void assertContainsAtLeast(Metadata minExpected, List<Metadata> metadataList) {
+
+        for (Metadata m : metadataList) {
+            int foundPropertyCount = 0;
+            for (String n : minExpected.names()) {
+                int foundValCount = 0;
+                for (String foundVal : m.getValues(n)) {
+                    for (String expectedVal : minExpected.getValues(n)) {
+                        if (foundVal.contains(expectedVal)) {
+                            foundValCount++;
+                        }
+                    }
+                }
+                if (foundValCount == minExpected.getValues(n).length) {
+                    foundPropertyCount++;
+                }
+            }
+            if (foundPropertyCount == minExpected.names().length) {
+                //found everything!
+                return;
+            }
+        }
+        //TODO: figure out how to have more informative error message
+        fail("Couldn't find everything within a single metadata item");
+    }
     protected static class XMLResult {
         public final String xml;
         public final Metadata metadata;
@@ -106,21 +161,44 @@ public abstract class TikaTest {
         }
     }
 
+    protected XMLResult getXML(String filePath, Parser parser, ParseContext context) throws Exception {
+        return getXML(getResourceAsStream("/test-documents/" + filePath), parser, new Metadata(), context);
+    }
+
     protected XMLResult getXML(String filePath, Parser parser, Metadata metadata) throws Exception {
-        return getXML(getResourceAsStream("/test-documents/" + filePath), parser, metadata);
+        return getXML(getResourceAsStream("/test-documents/" + filePath), parser, metadata, null);
+    }
+
+    protected XMLResult getXML(String filePath, ParseContext parseContext) throws Exception {
+        return getXML(filePath, new AutoDetectParser(), parseContext);
+    }
+
+    protected XMLResult getXML(String filePath, Metadata metadata, ParseContext parseContext) throws Exception {
+        return getXML(getResourceAsStream("/test-documents/"+filePath), new AutoDetectParser(), metadata, parseContext);
     }
 
     protected XMLResult getXML(String filePath, Metadata metadata) throws Exception {
-        return getXML(getResourceAsStream("/test-documents/" + filePath), new AutoDetectParser(), metadata);
+        return getXML(getResourceAsStream("/test-documents/" + filePath), new AutoDetectParser(), metadata, null);
+    }
+
+    protected XMLResult getXML(String filePath, Parser parser) throws Exception {
+        Metadata metadata = new Metadata();
+        metadata.set(Metadata.RESOURCE_NAME_KEY, filePath);
+        return getXML(filePath, parser, metadata);
     }
 
     protected XMLResult getXML(String filePath) throws Exception {
-        return getXML(getResourceAsStream("/test-documents/" + filePath), new AutoDetectParser(), new Metadata());
+        return getXML(getResourceAsStream("/test-documents/" + filePath), new AutoDetectParser(), new Metadata(), null);
     }
 
     protected XMLResult getXML(InputStream input, Parser parser, Metadata metadata) throws Exception {
-      ParseContext context = new ParseContext();
-      context.set(Parser.class, parser);
+        return getXML(input, parser, metadata, null);
+    }
+
+    protected XMLResult getXML(InputStream input, Parser parser, Metadata metadata, ParseContext context) throws Exception {
+      if (context == null) {
+          context = new ParseContext();
+      }
 
       try {
           ContentHandler handler = new ToXMLContentHandler();
@@ -129,7 +207,40 @@ public abstract class TikaTest {
       } finally {
           input.close();
       }
-  }
+    }
+
+    protected List<Metadata> getRecursiveMetadata(String filePath) throws Exception {
+        return getRecursiveMetadata(filePath, new ParseContext());
+    }
+
+    protected List<Metadata> getRecursiveMetadata(String filePath, ParseContext context) throws Exception {
+        Parser p = new AutoDetectParser();
+        RecursiveParserWrapper wrapper = new RecursiveParserWrapper(p,
+                new BasicContentHandlerFactory(BasicContentHandlerFactory.HANDLER_TYPE.XML, -1));
+        try (InputStream is = getResourceAsStream("/test-documents/" + filePath)) {
+            wrapper.parse(is, new DefaultHandler(), new Metadata(), context);
+        }
+        return wrapper.getMetadata();
+    }
+
+    protected List<Metadata> getRecursiveMetadata(String filePath, Parser parserToWrap) throws Exception {
+        RecursiveParserWrapper wrapper = new RecursiveParserWrapper(parserToWrap,
+                new BasicContentHandlerFactory(BasicContentHandlerFactory.HANDLER_TYPE.XML, -1));
+        try (InputStream is = getResourceAsStream("/test-documents/" + filePath)) {
+            wrapper.parse(is, new DefaultHandler(), new Metadata(), new ParseContext());
+        }
+        return wrapper.getMetadata();
+    }
+
+    protected List<Metadata> getRecursiveMetadata(String filePath, Parser parserToWrap, ParseContext parseContext) throws Exception {
+        RecursiveParserWrapper wrapper = new RecursiveParserWrapper(parserToWrap,
+                new BasicContentHandlerFactory(BasicContentHandlerFactory.HANDLER_TYPE.XML, -1));
+        try (InputStream is = getResourceAsStream("/test-documents/" + filePath)) {
+            wrapper.parse(is, new DefaultHandler(), new Metadata(), parseContext);
+        }
+        return wrapper.getMetadata();
+    }
+
 
     /**
      * Basic text extraction.
@@ -208,6 +319,26 @@ public abstract class TikaTest {
                 stream.reset();
             } catch (IOException e) {
                 //swallow
+            }
+        }
+    }
+
+    public static void debug(List<Metadata> list) {
+        int i = 0;
+        for (Metadata m : list) {
+            for (String n : m.names()) {
+                for (String v : m.getValues(n)) {
+                    System.out.println(i + ": "+n + " : "+v);
+                }
+            }
+            i++;
+        }
+    }
+
+    public static void debug(Metadata metadata) {
+        for (String n : metadata.names()) {
+            for (String v : metadata.getValues(n)) {
+                System.out.println(n + " : "+v);
             }
         }
     }

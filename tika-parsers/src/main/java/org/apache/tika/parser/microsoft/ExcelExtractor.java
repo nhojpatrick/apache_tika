@@ -42,6 +42,7 @@ import org.apache.poi.hssf.record.CountryRecord;
 import org.apache.poi.hssf.record.DateWindow1904Record;
 import org.apache.poi.hssf.record.DrawingGroupRecord;
 import org.apache.poi.hssf.record.EOFRecord;
+import org.apache.poi.hssf.record.ExtSSTRecord;
 import org.apache.poi.hssf.record.ExtendedFormatRecord;
 import org.apache.poi.hssf.record.FooterRecord;
 import org.apache.poi.hssf.record.FormatRecord;
@@ -165,7 +166,7 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
         Biff8EncryptionKey.setCurrentUserPassword(getPassword());
 
         // Have the file processed in event mode
-        TikaHSSFListener listener = new TikaHSSFListener(xhtml, locale, this);
+        TikaHSSFListener listener = new TikaHSSFListener(xhtml, locale, this, officeParserConfig);
         listener.processFile(root, isListenForAllRecords());
         listener.throwStoredException();
 
@@ -204,6 +205,8 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
          * @see <a href="https://issues.apache.org/jira/browse/TIKA-103">TIKA-103</a>
          */
         private final NumberFormat format;
+
+        private final OfficeParserConfig officeParserConfig;
         /**
          * Potential exception thrown by the content handler. When set to
          * non-<code>null</code>, causes all subsequent HSSF records to be
@@ -219,6 +222,8 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
          * formatting within the extraction.
          */
         private FormatTrackingHSSFListener formatListener;
+        private final TikaExcelDataFormatter tikaExcelDataFormatter;
+
         /**
          * List of worksheet names.
          */
@@ -251,11 +256,13 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
          *
          * @param handler Destination to write the parsed output to
          */
-        private TikaHSSFListener(XHTMLContentHandler handler, Locale locale, AbstractPOIFSExtractor extractor) {
+        private TikaHSSFListener(XHTMLContentHandler handler, Locale locale, AbstractPOIFSExtractor extractor, OfficeParserConfig officeParserConfig) {
             this.handler = handler;
             this.extractor = extractor;
             this.format = NumberFormat.getInstance(locale);
-            this.formatListener = new FormatTrackingHSSFListener(this, locale);
+            this.formatListener = new TikaFormatTrackingHSSFListener(this, locale);
+            this.tikaExcelDataFormatter = new TikaExcelDataFormatter(locale);
+            this.officeParserConfig = officeParserConfig;
         }
 
         /**
@@ -277,6 +284,7 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
 
             // Set up listener and register the records we want to process
             HSSFRequest hssfRequest = new HSSFRequest();
+            listenForAllRecords = true;
             if (listenForAllRecords) {
                 hssfRequest.addListenerForAllRecords(formatListener);
             } else {
@@ -298,8 +306,10 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
                 hssfRequest.addListener(formatListener, FormatRecord.sid);
                 hssfRequest.addListener(formatListener, ExtendedFormatRecord.sid);
                 hssfRequest.addListener(formatListener, DrawingGroupRecord.sid);
-                hssfRequest.addListener(formatListener, HeaderRecord.sid);
-                hssfRequest.addListener(formatListener, FooterRecord.sid);
+                if (extractor.officeParserConfig.getIncludeHeadersAndFooters()) {
+                    hssfRequest.addListener(formatListener, HeaderRecord.sid);
+                    hssfRequest.addListener(formatListener, FooterRecord.sid);
+                }
             }
 
             // Create event factory and process Workbook (fire events)
@@ -421,7 +431,18 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
                 case LabelSSTRecord.sid: // Ref. a string in the shared string table
                     LabelSSTRecord sst = (LabelSSTRecord) record;
                     UnicodeString unicode = sstRecord.getString(sst.getSSTIndex());
-                    addTextCell(record, unicode.getString());
+                    String cellString = null;
+                    if (officeParserConfig.getConcatenatePhoneticRuns()) {
+                        String phonetic = (unicode != null
+                                && unicode.getExtendedRst() != null
+                                && unicode.getExtendedRst().getPhoneticText() != null
+                                && unicode.getExtendedRst().getPhoneticText().trim().length() > 0) ?
+                                unicode.getExtendedRst().getPhoneticText() : "";
+                        cellString = unicode.getString()+" "+phonetic;
+                    } else {
+                        cellString = unicode.getString();
+                    }
+                    addTextCell(record, cellString);
                     break;
 
                 case NumberRecord.sid: // Contains a numeric cell value
@@ -452,8 +473,10 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
                     break;
 
                 case TextObjectRecord.sid:
-                    TextObjectRecord tor = (TextObjectRecord) record;
-                    addTextCell(record, tor.getStr().getString());
+                    if (extractor.officeParserConfig.getIncludeShapeBasedContent()) {
+                        TextObjectRecord tor = (TextObjectRecord) record;
+                        addTextCell(record, tor.getStr().getString());
+                    }
                     break;
 
                 case SeriesTextRecord.sid: // Chart label or title
@@ -468,13 +491,17 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
                     break;
                     
                 case HeaderRecord.sid:
-                	HeaderRecord headerRecord = (HeaderRecord) record;
-                	addTextCell(record, headerRecord.getText());
+                	if (extractor.officeParserConfig.getIncludeHeadersAndFooters()) {
+                        HeaderRecord headerRecord = (HeaderRecord) record;
+                        addTextCell(record, headerRecord.getText());
+                    }
                 	break;
                 	
                 case FooterRecord.sid:
-                	FooterRecord footerRecord = (FooterRecord) record;
-                	addTextCell(record, footerRecord.getText());
+                    if (extractor.officeParserConfig.getIncludeHeadersAndFooters()) {
+                        FooterRecord footerRecord = (FooterRecord) record;
+                        addTextCell(record, footerRecord.getText());
+                    }
                 	break;
 
             }
@@ -612,6 +639,35 @@ public class ExcelExtractor extends AbstractPOIFSExtractor {
 
                 // Recursive call.
                 findPictures(escherRecord.getChildRecords());
+            }
+        }
+        private class TikaFormatTrackingHSSFListener extends FormatTrackingHSSFListener {
+            //TIKA-2025 -- use this to preserve large numbers in "General" format
+            //against the MS spec.
+            final TikaExcelGeneralFormat generalFormat;
+            public TikaFormatTrackingHSSFListener(HSSFListener childListener, Locale locale) {
+                super(childListener, locale);
+                generalFormat = new TikaExcelGeneralFormat(locale);
+            }
+
+            @Override
+            public String formatNumberDateCell(CellValueRecordInterface cell) {
+                String formatString = this.getFormatString(cell);
+                if (formatString != null && ! formatString.equals("General")) {
+                    return super.formatNumberDateCell(cell);
+                }
+
+                double value;
+                if(cell instanceof NumberRecord) {
+                    value = ((NumberRecord)cell).getValue();
+                } else {
+                    if(!(cell instanceof FormulaRecord)) {
+                        throw new IllegalArgumentException("Unsupported CellValue Record passed in " + cell);
+                    }
+
+                    value = ((FormulaRecord)cell).getValue();
+                }
+                return generalFormat.format(value);
             }
         }
     }

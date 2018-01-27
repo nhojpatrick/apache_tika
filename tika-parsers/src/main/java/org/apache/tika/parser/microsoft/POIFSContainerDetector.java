@@ -21,6 +21,7 @@ import static org.apache.tika.mime.MediaType.application;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
@@ -68,6 +69,16 @@ public class POIFSContainerDetector implements Detector {
      */
     public static final MediaType COMP_OBJ =
             new MediaType(GENERAL_EMBEDDED, "format", "comp_obj");
+    /**
+     * Graph/Charts embedded in PowerPoint and Excel
+     */
+    public static final MediaType MS_GRAPH_CHART = application("vnd.ms-graph");
+
+    /**
+     * Equation embedded in Office docs
+     */
+    public static final MediaType MS_EQUATION = application("vnd.ms-equation");
+
     /**
      * Microsoft Excel
      */
@@ -128,6 +139,11 @@ public class POIFSContainerDetector implements Detector {
      * Hangul Word Processor (Korean)
      */
     public static final MediaType HWP = application("x-hwp-v5");
+
+    /**
+     * Base QuattroPro mime
+     */
+    public static final MediaType QUATTROPRO = application("x-quattro-pro");
     /**
      * Serial version UID
      */
@@ -135,21 +151,24 @@ public class POIFSContainerDetector implements Detector {
     /**
      * An ASCII String "StarImpress"
      */
-    private static final byte[] STAR_IMPRESS = new byte[]{
-            0x53, 0x74, 0x61, 0x72, 0x49, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73
-    };
+    private static final byte[] STAR_IMPRESS = "StarImpress".getBytes(StandardCharsets.US_ASCII);
+    
     /**
      * An ASCII String "StarDraw"
      */
-    private static final byte[] STAR_DRAW = new byte[]{
-            0x53, 0x74, 0x61, 0x72, 0x44, 0x72, 0x61, 0x77
-    };
+    private static final byte[] STAR_DRAW = "StarDraw".getBytes(StandardCharsets.US_ASCII);
+    
     /**
      * An ASCII String "Quill96" for Works Files
      */
-    private static final byte[] WORKS_QUILL96 = new byte[]{
-            0x51, 0x75, 0x69, 0x6c, 0x6c, 0x39, 0x36
-    };
+    private static final byte[] WORKS_QUILL96 = "Quill96".getBytes(StandardCharsets.US_ASCII);
+
+    /**
+     * An ASCII String "MSGraph.Chart" for embedded MSGraph files
+     * The full designator includes a version, e.g. MSGraph.Chart.8
+     */
+    private static final byte[] MS_GRAPH_CHART_BYTES = "MSGraph.Chart".getBytes(StandardCharsets.US_ASCII);
+
     /**
      * Regexp for matching the MPP Project Data stream
      */
@@ -209,6 +228,10 @@ public class POIFSContainerDetector implements Detector {
                 // we want to avoid classifying this as Excel
                 return XLR;
             } else if (names.contains("Workbook") || names.contains("WORKBOOK")) {
+                MediaType tmp = processCompObjFormatType(root);
+                if (tmp.equals(MS_GRAPH_CHART)) {
+                    return MS_GRAPH_CHART;
+                }
                 return XLS;
             } else if (names.contains("Book")) {
                 // Excel 95 or older, we won't be able to parse this....
@@ -274,10 +297,12 @@ public class POIFSContainerDetector implements Detector {
                 if (names.contains("SlideShow")) {
                     return MediaType.application("x-corelpresentations"); // .shw
                 } else if (names.contains("PerfectOffice_OBJECTS")) {
-                    return MediaType.application("x-quattro-pro"); // .wb?
+                    return new MediaType(QUATTROPRO, "version", "7-8"); // .wb?
                 }
             } else if (names.contains("NativeContent_MAIN")) {
-                return MediaType.application("x-quattro-pro"); // .qpw
+                return new MediaType(QUATTROPRO, "version", "9"); // .qpw
+            } else if (names.contains("Equation Native")) {
+                return MS_EQUATION;
             } else {
                 for (String name : names) {
                     if (name.startsWith("__substg1.0_")) {
@@ -309,7 +334,9 @@ public class POIFSContainerDetector implements Detector {
                  * application used to create this file. We want to search for that
                  * name.
                  */
-                if (arrayContains(bytes, STAR_DRAW)) {
+                if (arrayContains(bytes, MS_GRAPH_CHART_BYTES)) {
+                    return MS_GRAPH_CHART;
+                } else if (arrayContains(bytes, STAR_DRAW)) {
                     return SDA;
                 } else if (arrayContains(bytes, STAR_IMPRESS)) {
                     return SDD;

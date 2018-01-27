@@ -17,9 +17,10 @@ package org.apache.tika.parser.jdbc;
  */
 
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.Connection;
@@ -36,14 +37,11 @@ import org.apache.commons.io.IOExceptionWithCause;
 import org.apache.commons.io.IOUtils;
 import org.apache.tika.config.TikaConfig;
 import org.apache.tika.detect.Detector;
-import org.apache.tika.extractor.EmbeddedDocumentExtractor;
+import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Database;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaMetadataKeys;
-import org.apache.tika.mime.MediaType;
-import org.apache.tika.mime.MimeType;
-import org.apache.tika.mime.MimeTypeException;
 import org.apache.tika.mime.MimeTypes;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.XHTMLContentHandler;
@@ -51,8 +49,6 @@ import org.xml.sax.Attributes;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
  * General base class to iterate through rows of a JDBC table
@@ -65,14 +61,11 @@ class JDBCTableReader {
     int maxClobLength = 1000000;
     ResultSet results = null;
     int rows = 0;
-    private TikaConfig tikaConfig = null;
-    private Detector detector = null;
-    private MimeTypes mimeTypes = null;
-
+    private final EmbeddedDocumentUtil embeddedDocumentUtil;
     public JDBCTableReader(Connection connection, String tableName, ParseContext context) {
         this.connection = connection;
         this.tableName = tableName;
-        this.tikaConfig = context.get(TikaConfig.class);
+        embeddedDocumentUtil = new EmbeddedDocumentUtil(context);
     }
 
     public boolean nextRow(ContentHandler handler, ParseContext context) throws IOException, SAXException {
@@ -112,7 +105,7 @@ class JDBCTableReader {
                 handleClob(tableName, rsmd.getColumnName(i), rows, results, i, handler, context);
                 break;
             case Types.BOOLEAN:
-                handleBoolean(results.getBoolean(i), handler);
+                handleBoolean(results, i, handler);
                 break;
             case Types.DATE:
                 handleDate(results, i, handler);
@@ -121,18 +114,27 @@ class JDBCTableReader {
                 handleTimeStamp(results, i, handler);
                 break;
             case Types.INTEGER:
-                handleInteger(rsmd.getColumnTypeName(i), results, i, handler);
+                handleInteger(results, i, handler);
                 break;
             case Types.FLOAT:
                 //this is necessary to handle rounding issues in presentation
                 //Should we just use getString(i)?
-                addAllCharacters(Float.toString(results.getFloat(i)), handler);
+                float f = results.getFloat(i);
+                if (! results.wasNull()) {
+                    addAllCharacters(Float.toString(f), handler);
+                }
                 break;
             case Types.DOUBLE:
-                addAllCharacters(Double.toString(results.getDouble(i)), handler);
+                double d = results.getDouble(i);
+                if (! results.wasNull()) {
+                    addAllCharacters(Double.toString(d), handler);
+                }
                 break;
             default:
-                addAllCharacters(results.getString(i), handler);
+                String s = results.getString(i);
+                if (!results.wasNull()) {
+                    addAllCharacters(s, handler);
+                }
                 break;
         }
     }
@@ -154,12 +156,18 @@ class JDBCTableReader {
         return headers;
     }
 
-    protected void handleInteger(String columnTypeName, ResultSet rs, int columnIndex, ContentHandler handler) throws SQLException, SAXException {
-        addAllCharacters(Integer.toString(rs.getInt(columnIndex)), handler);
+    protected void handleInteger(ResultSet rs, int columnIndex, ContentHandler handler) throws SQLException, SAXException {
+        int i = rs.getInt(columnIndex);
+        if (! rs.wasNull()) {
+            addAllCharacters(Integer.toString(i), handler);
+        }
     }
 
-    private void handleBoolean(boolean aBoolean, ContentHandler handler) throws SAXException {
-        addAllCharacters(Boolean.toString(aBoolean), handler);
+    private void handleBoolean(ResultSet rs, int columnIndex, ContentHandler handler) throws SAXException, SQLException {
+        boolean b = rs.getBoolean(columnIndex);
+        if (! rs.wasNull()) {
+            addAllCharacters(Boolean.toString(b), handler);
+        }
     }
 
 
@@ -167,6 +175,9 @@ class JDBCTableReader {
                               ResultSet resultSet, int columnIndex,
                               ContentHandler handler, ParseContext context) throws SQLException, IOException, SAXException {
         Clob clob = resultSet.getClob(columnIndex);
+        if (resultSet.wasNull()) {
+            return;
+        }
         boolean truncated = clob.length() > Integer.MAX_VALUE || clob.length() > maxClobLength;
 
         int readSize = (clob.length() < maxClobLength ? (int) clob.length() : maxClobLength);
@@ -186,8 +197,9 @@ class JDBCTableReader {
 
         //is there a more efficient way to go from a Reader to an InputStream?
         String s = clob.getSubString(0, readSize);
-        EmbeddedDocumentExtractor ex = AbstractDBParser.getEmbeddedDocumentExtractor(context);
-        ex.parseEmbedded(new ByteArrayInputStream(s.getBytes(UTF_8)), handler, m, true);
+        if (embeddedDocumentUtil.shouldParseEmbedded(m)) {
+            embeddedDocumentUtil.parseEmbedded(new ByteArrayInputStream(s.getBytes(UTF_8)), handler, m, true);
+        }
     }
 
     protected void handleBlob(String tableName, String columnName, int rowNum, ResultSet resultSet, int columnIndex,
@@ -198,36 +210,32 @@ class JDBCTableReader {
         m.set(Database.PREFIX + "ROW_NUM", Integer.toString(rowNum));
         m.set(Database.PREFIX + "IS_BLOB", "true");
         Blob blob = null;
-        InputStream is = null;
-        EmbeddedDocumentExtractor ex = AbstractDBParser.getEmbeddedDocumentExtractor(context);
+        TikaInputStream is = null;
         try {
-            is = TikaInputStream.get(getInputStreamFromBlob(resultSet, columnIndex, blob, m));
-
+            blob = getBlob(resultSet, columnIndex, m);
+            if (blob == null) {
+                return;
+            }
+            is = TikaInputStream.get(blob, m);
             Attributes attrs = new AttributesImpl();
             ((AttributesImpl) attrs).addAttribute("", "type", "type", "CDATA", "blob");
             ((AttributesImpl) attrs).addAttribute("", "column_name", "column_name", "CDATA", columnName);
             ((AttributesImpl) attrs).addAttribute("", "row_number", "row_number", "CDATA", Integer.toString(rowNum));
             handler.startElement("", "span", "span", attrs);
-            MediaType mediaType = getDetector().detect(is, new Metadata());
-            String extension = "";
-            try {
-                MimeType mimeType = getMimeTypes().forName(mediaType.toString());
-                m.set(Metadata.CONTENT_TYPE, mimeType.toString());
-                extension = mimeType.getExtension();
-            } catch (MimeTypeException e) {
-                //swallow
-            }
+            String extension = embeddedDocumentUtil.getExtension(is, m);
+
             m.set(TikaMetadataKeys.RESOURCE_NAME_KEY,
                     //just in case something screwy is going on with the column name
                     FilenameUtils.normalize(FilenameUtils.getName(columnName + "_" + rowNum + extension)));
-
-            ex.parseEmbedded(is, handler, m, true);
+            if (embeddedDocumentUtil.shouldParseEmbedded(m)) {
+                embeddedDocumentUtil.parseEmbedded(is, handler, m, true);
+            }
 
         } finally {
             if (blob != null) {
                 try {
                     blob.free();
-                } catch (SQLException e) {
+                } catch (SQLException|UnsupportedOperationException e) {
                     //swallow
                 }
             }
@@ -236,8 +244,20 @@ class JDBCTableReader {
         handler.endElement("", "span", "span");
     }
 
-    protected InputStream getInputStreamFromBlob(ResultSet resultSet, int columnIndex, Blob blob, Metadata metadata) throws SQLException {
-        return TikaInputStream.get(blob, metadata);
+    /**
+     *
+     * @param resultSet result set to grab value from
+     * @param columnIndex index in result set
+     * @param metadata metadata to populate or use for each implementation
+     * @return the blob or <code>null</code> if the value was null
+     * @throws SQLException
+     */
+    protected Blob getBlob(ResultSet resultSet, int columnIndex, Metadata metadata) throws SQLException {
+        Blob blob = resultSet.getBlob(columnIndex);
+        if (! resultSet.wasNull()) {
+            return blob;
+        }
+        return null;
     }
 
     protected void handleDate(ResultSet resultSet, int columnIndex, ContentHandler handler) throws SAXException, SQLException {
@@ -249,6 +269,9 @@ class JDBCTableReader {
     }
 
     protected void addAllCharacters(String s, ContentHandler handler) throws SAXException {
+        if (s == null) {
+            return;
+        }
         char[] chars = s.toCharArray();
         handler.characters(chars, 0, chars.length);
     }
@@ -279,24 +302,15 @@ class JDBCTableReader {
 
 
     protected TikaConfig getTikaConfig() {
-        if (tikaConfig == null) {
-            tikaConfig = TikaConfig.getDefaultConfig();
-        }
-        return tikaConfig;
+        return embeddedDocumentUtil.getTikaConfig();
     }
 
     protected Detector getDetector() {
-        if (detector != null) return detector;
-
-        detector = getTikaConfig().getDetector();
-        return detector;
+        return embeddedDocumentUtil.getDetector();
     }
 
     protected MimeTypes getMimeTypes() {
-        if (mimeTypes != null) return mimeTypes;
-
-        mimeTypes = getTikaConfig().getMimeRepository();
-        return mimeTypes;
+        return embeddedDocumentUtil.getMimeTypes();
     }
 
 }

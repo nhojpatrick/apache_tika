@@ -16,19 +16,19 @@
  */
 package org.apache.tika.parser.pdf;
 
+import javax.xml.namespace.QName;
+import javax.xml.stream.XMLStreamConstants;
+import javax.xml.stream.XMLStreamException;
+import javax.xml.stream.XMLStreamReader;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import javax.xml.namespace.QName;
-import javax.xml.stream.XMLInputFactory;
-import javax.xml.stream.XMLResolver;
-import javax.xml.stream.XMLStreamConstants;
-import javax.xml.stream.XMLStreamException;
-import javax.xml.stream.XMLStreamReader;
+
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.XHTMLContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
@@ -62,20 +62,6 @@ class XFAExtractor {
     private static final String FIELD_LN = "field";
     private static final QName XFA_DATA = new QName(XFA_DATA_NS, "data");
 
-    private static final XMLInputFactory factory;
-
-    static {
-        factory = XMLInputFactory.newFactory();
-        factory.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, true);
-        factory.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
-        factory.setProperty(XMLInputFactory.IS_VALIDATING, false);
-        factory.setXMLResolver(new XMLResolver() {
-            @Override
-            public Object resolveEntity(String publicID, String systemID, String baseURI, String namespace) throws XMLStreamException {
-                return null;
-            }
-        });
-    }
     private final Matcher xfaTemplateMatcher;//namespace any version
     private final Matcher textMatcher;
 
@@ -84,7 +70,7 @@ class XFAExtractor {
         textMatcher = TEXT_PATTERN.matcher("");
     }
 
-    void extract(InputStream xfaIs, XHTMLContentHandler xhtml, Metadata m)
+    void extract(InputStream xfaIs, XHTMLContentHandler xhtml, Metadata m, ParseContext context)
             throws XMLStreamException, SAXException {
         xhtml.startElement("div", "class", "xfa_content");
 
@@ -99,7 +85,7 @@ class XFAExtractor {
         //
         //As a final step, dump the merged fields and the values.
 
-        XMLStreamReader reader = factory.createXMLStreamReader(xfaIs);
+        XMLStreamReader reader = context.getXMLInputFactory().createXMLStreamReader(xfaIs);
         while (reader.hasNext()) {
             switch (reader.next()) {
                 case XMLStreamConstants.START_ELEMENT :
@@ -232,16 +218,34 @@ class XFAExtractor {
     private void loadData(XMLStreamReader reader, Map<String, String> pdfObjRToValues)
             throws XMLStreamException {
         //reader is at the "xfa:data" element
+        //scrape the contents from the text containing nodes
+        StringBuilder buffer = new StringBuilder();
         while (reader.hasNext()) {
             switch (reader.next()) {
                 case (XMLStreamConstants.START_ELEMENT) :
-                    if ("topmostSubform".equals(reader.getLocalName())) {
-                        continue;
-                    }
-                    String value = scrapeTextUntil(reader, reader.getName());
-                    pdfObjRToValues.put(reader.getLocalName(), value);
                     break;
+                case XMLStreamConstants.CHARACTERS:
+                    int start = reader.getTextStart();
+                    int length = reader.getTextLength();
+                    buffer.append(reader.getTextCharacters(),
+                            start,
+                            length);
+                    break;
+
+                case XMLStreamConstants.CDATA:
+                    start = reader.getTextStart();
+                    length = reader.getTextLength();
+                    buffer.append(reader.getTextCharacters(),
+                            start,
+                            length);
+                    break;
+
                 case (XMLStreamConstants.END_ELEMENT) :
+                    if (buffer.length() > 0) {
+                        String localName = reader.getLocalName();
+                        pdfObjRToValues.put(localName, buffer.toString());
+                        buffer.setLength(0);
+                    }
                     if (XFA_DATA.equals(reader.getName())) {
                         return;
                     }

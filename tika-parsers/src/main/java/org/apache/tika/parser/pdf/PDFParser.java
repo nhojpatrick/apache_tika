@@ -16,6 +16,7 @@
  */
 package org.apache.tika.parser.pdf;
 
+import javax.xml.parsers.DocumentBuilder;
 import javax.xml.stream.XMLStreamException;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -25,9 +26,11 @@ import java.util.Calendar;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 import org.apache.commons.io.input.CloseShieldInputStream;
+import org.apache.jempbox.xmp.XMPMetadata;
 import org.apache.jempbox.xmp.XMPSchema;
 import org.apache.jempbox.xmp.XMPSchemaDublinCore;
 import org.apache.jempbox.xmp.pdfa.XMPSchemaPDFAId;
@@ -36,21 +39,26 @@ import org.apache.pdfbox.cos.COSBase;
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.cos.COSString;
-import org.apache.pdfbox.exceptions.CryptographyException;
-import org.apache.pdfbox.io.RandomAccess;
-import org.apache.pdfbox.io.RandomAccessBuffer;
-import org.apache.pdfbox.io.RandomAccessFile;
+import org.apache.pdfbox.io.MemoryUsageSetting;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
+import org.apache.pdfbox.pdmodel.common.PDMetadata;
 import org.apache.pdfbox.pdmodel.encryption.AccessPermission;
-import org.apache.pdfbox.pdmodel.font.PDFont;
+import org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException;
+import org.apache.poi.util.IOUtils;
+import org.apache.tika.config.Field;
+import org.apache.tika.config.Initializable;
+import org.apache.tika.config.InitializableProblemHandler;
+import org.apache.tika.config.Param;
 import org.apache.tika.exception.EncryptedDocumentException;
+import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
-import org.apache.tika.io.TemporaryResources;
+import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.AccessPermissions;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.PDF;
 import org.apache.tika.metadata.PagedText;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -58,8 +66,12 @@ import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.AbstractParser;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.PasswordProvider;
+import org.apache.tika.parser.image.xmp.JempboxExtractor;
+import org.apache.tika.parser.ocr.TesseractOCRParser;
 import org.apache.tika.sax.XHTMLContentHandler;
+import org.w3c.dom.Document;
 import org.xml.sax.ContentHandler;
+import org.xml.sax.ErrorHandler;
 import org.xml.sax.SAXException;
 
 /**
@@ -79,9 +91,19 @@ import org.xml.sax.SAXException;
  * the potentially enormous number and size of inline images.  To
  * turn this feature on, see
  * {@link PDFParserConfig#setExtractInlineImages(boolean)}.
+ * <p/>
+ * Please note that tables are not stored as entities within PDFs. It
+ * takes significant computation to identify and then correctly extract
+ * tables from PDFs. As of this writing, the {@link PDFParser} extracts
+ * text within tables, but it does not compute table cell boundaries or
+ * table row boundaries. Please see
+ * <a href="http://tabula.technology/">tabula</a> for one project that
+ * tries to maintain the structure of tables represented in PDFs.
  */
-public class PDFParser extends AbstractParser {
+public class PDFParser extends AbstractParser implements Initializable {
 
+    private static volatile boolean HAS_WARNED = false;
+    private static final Object[] LOCK = new Object[0];
 
     /**
      * Metadata key for giving the document password to the parser.
@@ -98,6 +120,7 @@ public class PDFParser extends AbstractParser {
     private static final Set<MediaType> SUPPORTED_TYPES =
             Collections.singleton(MEDIA_TYPE);
     private PDFParserConfig defaultConfig = new PDFParserConfig();
+    private InitializableProblemHandler initializableProblemHandler = null;
 
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return SUPPORTED_TYPES;
@@ -108,73 +131,50 @@ public class PDFParser extends AbstractParser {
             Metadata metadata, ParseContext context)
             throws IOException, SAXException, TikaException {
 
-        PDDocument pdfDocument = null;
-        TemporaryResources tmp = new TemporaryResources();
-        //config from context, or default if not set via context
         PDFParserConfig localConfig = context.get(PDFParserConfig.class, defaultConfig);
+
+        PDDocument pdfDocument = null;
+
         String password = "";
         try {
-            // PDFBox can process entirely in memory, or can use a temp file
-            //  for unpacked / processed resources
-            // Decide which to do based on if we're reading from a file or not already
             TikaInputStream tstream = TikaInputStream.cast(stream);
             password = getPassword(metadata, context);
+            MemoryUsageSetting memoryUsageSetting = MemoryUsageSetting.setupMainMemoryOnly();
+            if (localConfig.getMaxMainMemoryBytes() >= 0) {
+                memoryUsageSetting = MemoryUsageSetting.setupMixed(localConfig.getMaxMainMemoryBytes());
+            }
             if (tstream != null && tstream.hasFile()) {
-                // File based, take that as a cue to use a temporary file
-                RandomAccess scratchFile = new RandomAccessFile(tmp.createTemporaryFile(), "rw");
-                if (localConfig.getUseNonSequentialParser() == true) {
-                    pdfDocument = PDDocument.loadNonSeq(new CloseShieldInputStream(stream), scratchFile, password);
-                } else {
-                    pdfDocument = PDDocument.load(new CloseShieldInputStream(stream), scratchFile, true);
-                }
+                // File based -- send file directly to PDFBox
+                pdfDocument = PDDocument.load(tstream.getPath().toFile(), password, memoryUsageSetting);
             } else {
-                // Go for the normal, stream based in-memory parsing
-                if (localConfig.getUseNonSequentialParser() == true) {
-                    pdfDocument = PDDocument.loadNonSeq(new CloseShieldInputStream(stream), new RandomAccessBuffer(), password);
-                } else {
-                    pdfDocument = PDDocument.load(new CloseShieldInputStream(stream), true);
-                }
+                pdfDocument = PDDocument.load(new CloseShieldInputStream(stream), password, memoryUsageSetting);
             }
-            metadata.set("pdf:encrypted", Boolean.toString(pdfDocument.isEncrypted()));
+            metadata.set(PDF.IS_ENCRYPTED, Boolean.toString(pdfDocument.isEncrypted()));
 
-            //if using the classic parser and the doc is encrypted, we must manually decrypt
-            if (!localConfig.getUseNonSequentialParser() && pdfDocument.isEncrypted()) {
-                pdfDocument.decrypt(password);
-            }
-
-            metadata.set(Metadata.CONTENT_TYPE, "application/pdf");
-            extractMetadata(pdfDocument, metadata);
-
+            metadata.set(Metadata.CONTENT_TYPE, MEDIA_TYPE.toString());
+            extractMetadata(pdfDocument, metadata, context);
             AccessChecker checker = localConfig.getAccessChecker();
             checker.check(metadata);
             if (handler != null) {
                 if (shouldHandleXFAOnly(pdfDocument, localConfig)) {
-                    handleXFAOnly(pdfDocument, handler, metadata);
+                    handleXFAOnly(pdfDocument, handler, metadata, context);
+                } else if (localConfig.getOcrStrategy().equals(PDFParserConfig.OCR_STRATEGY.OCR_ONLY)) {
+                    metadata.add("X-Parsed-By", TesseractOCRParser.class.toString());
+                    OCR2XHTML.process(pdfDocument, handler, context, metadata, localConfig);
                 } else {
+                    if (localConfig.getOcrStrategy().equals(PDFParserConfig.OCR_STRATEGY.OCR_AND_TEXT_EXTRACTION)) {
+                        metadata.add("X-Parsed-By", TesseractOCRParser.class.toString());
+                    }
                     PDF2XHTML.process(pdfDocument, handler, context, metadata, localConfig);
                 }
             }
-
-        } catch (CryptographyException e) {
-            //seq parser throws CryptographyException for bad password
+        } catch (InvalidPasswordException e) {
+            metadata.set(PDF.IS_ENCRYPTED, "true");
             throw new EncryptedDocumentException(e);
-        } catch (IOException e) {
-            //nonseq parser throws IOException for bad password
-            //At the Tika level, we want the same exception to be thrown
-            if (e.getMessage() != null &&
-                    e.getMessage().contains("Error (CryptographyException)")) {
-                metadata.set("pdf:encrypted", Boolean.toString(true));
-                throw new EncryptedDocumentException(e);
-            }
-            //rethrow any other IOExceptions
-            throw e;
         } finally {
             if (pdfDocument != null) {
                 pdfDocument.close();
             }
-            tmp.dispose();
-            //TODO: once we migrate to PDFBox 2.0, remove this (PDFBOX-2200)
-            PDFont.clearResources();
         }
     }
 
@@ -200,7 +200,7 @@ public class PDFParser extends AbstractParser {
     }
 
 
-    private void extractMetadata(PDDocument document, Metadata metadata)
+    private void extractMetadata(PDDocument document, Metadata metadata, ParseContext context)
             throws TikaException {
 
         //first extract AccessPermissions
@@ -223,55 +223,63 @@ public class PDFParser extends AbstractParser {
                 Boolean.toString(ap.canPrintDegraded()));
 
 
-        //now go for the XMP stuff
-        org.apache.jempbox.xmp.XMPMetadata xmp = null;
-        XMPSchemaDublinCore dcSchema = null;
-        try {
-            if (document.getDocumentCatalog().getMetadata() != null) {
-                xmp = document.getDocumentCatalog().getMetadata().exportXMPMetadata();
-            }
-            if (xmp != null) {
-                dcSchema = xmp.getDublinCoreSchema();
-            }
-        } catch (IOException e) {
-            //swallow
+        //now go for the XMP
+        Document dom = loadDOM(document.getDocumentCatalog().getMetadata(), metadata, context);
+
+        XMPMetadata xmp = null;
+        if (dom != null) {
+            xmp = new XMPMetadata(dom);
         }
+        XMPSchemaDublinCore dcSchema = null;
+
+        if (xmp != null) {
+            try {
+                dcSchema = xmp.getDublinCoreSchema();
+            } catch (IOException e) {}
+
+            JempboxExtractor.extractXMPMM(xmp, metadata);
+        }
+
         PDDocumentInformation info = document.getDocumentInformation();
         metadata.set(PagedText.N_PAGES, document.getNumberOfPages());
         extractMultilingualItems(metadata, TikaCoreProperties.TITLE, info.getTitle(), dcSchema);
+        addMetadata(metadata, PDF.DOC_INFO_TITLE, info.getTitle());
         extractDublinCoreListItems(metadata, TikaCoreProperties.CREATOR, info.getAuthor(), dcSchema);
+        addMetadata(metadata, PDF.DOC_INFO_CREATOR, info.getAuthor());
         extractDublinCoreListItems(metadata, TikaCoreProperties.CONTRIBUTOR, null, dcSchema);
         addMetadata(metadata, TikaCoreProperties.CREATOR_TOOL, info.getCreator());
+        addMetadata(metadata, PDF.DOC_INFO_CREATOR_TOOL, info.getCreator());
         addMetadata(metadata, TikaCoreProperties.KEYWORDS, info.getKeywords());
+        addMetadata(metadata, PDF.DOC_INFO_KEY_WORDS, info.getKeywords());
         addMetadata(metadata, "producer", info.getProducer());
+        addMetadata(metadata, PDF.DOC_INFO_PRODUCER, info.getProducer());
         extractMultilingualItems(metadata, TikaCoreProperties.DESCRIPTION, null, dcSchema);
+
+        addMetadata(metadata, PDF.DOC_INFO_SUBJECT, info.getSubject());
 
         // TODO: Move to description in Tika 2.0
         addMetadata(metadata, TikaCoreProperties.TRANSITION_SUBJECT_TO_OO_SUBJECT, info.getSubject());
         addMetadata(metadata, "trapped", info.getTrapped());
-        try {
+        addMetadata(metadata, PDF.DOC_INFO_TRAPPED, info.getTrapped());
             // TODO Remove these in Tika 2.0
-            addMetadata(metadata, "created", info.getCreationDate());
-            addMetadata(metadata, TikaCoreProperties.CREATED, info.getCreationDate());
-        } catch (IOException e) {
-            // Invalid date format, just ignore
-        }
-        try {
-            Calendar modified = info.getModificationDate();
-            addMetadata(metadata, Metadata.LAST_MODIFIED, modified);
-            addMetadata(metadata, TikaCoreProperties.MODIFIED, modified);
-        } catch (IOException e) {
-            // Invalid date format, just ignore
-        }
+        addMetadata(metadata, "created", info.getCreationDate());
+        addMetadata(metadata, PDF.DOC_INFO_CREATED, info.getCreationDate());
+        addMetadata(metadata, TikaCoreProperties.CREATED, info.getCreationDate());
+        Calendar modified = info.getModificationDate();
+        addMetadata(metadata, Metadata.LAST_MODIFIED, modified);
+        addMetadata(metadata, TikaCoreProperties.MODIFIED, modified);
+        addMetadata(metadata, PDF.DOC_INFO_MODIFICATION_DATE, info.getModificationDate());
 
         // All remaining metadata is custom
         // Copy this over as-is
         List<String> handledMetadata = Arrays.asList("Author", "Creator", "CreationDate", "ModDate",
                 "Keywords", "Producer", "Subject", "Title", "Trapped");
-        for (COSName key : info.getDictionary().keySet()) {
+        for (COSName key : info.getCOSObject().keySet()) {
             String name = key.getName();
             if (!handledMetadata.contains(name)) {
-                addMetadata(metadata, name, info.getDictionary().getDictionaryObject(key));
+                addMetadata(metadata, name, info.getCOSObject().getDictionaryObject(key));
+                addMetadata(metadata, PDF.PDF_DOC_INFO_CUSTOM_PREFIX + name,
+                        info.getCOSObject().getDictionaryObject(key));
             }
         }
 
@@ -279,8 +287,8 @@ public class PDFParser extends AbstractParser {
         //Caveats:
         //    there is currently a fair amount of redundancy
         //    TikaCoreProperties.FORMAT can be multivalued
-        //    There are also three potential pdf specific version keys: pdf:PDFVersion, pdfa:PDFVersion, pdf:PDFExtensionVersion        
-        metadata.set("pdf:PDFVersion", Float.toString(document.getDocument().getVersion()));
+        //    There are also three potential pdf specific version keys: pdf:PDFVersion, pdfa:PDFVersion, pdf:PDFExtensionVersion
+        metadata.set(PDF.PDF_VERSION, Float.toString(document.getDocument().getVersion()));
         metadata.add(TikaCoreProperties.FORMAT.getName(),
                 MEDIA_TYPE.toString() + "; version=" +
                         Float.toString(document.getDocument().getVersion()));
@@ -291,12 +299,12 @@ public class PDFParser extends AbstractParser {
                 XMPSchemaPDFAId pdfaxmp = (XMPSchemaPDFAId) xmp.getSchemaByClass(XMPSchemaPDFAId.class);
                 if (pdfaxmp != null) {
                     if (pdfaxmp.getPart() != null) {
-                        metadata.set("pdfaid:part", Integer.toString(pdfaxmp.getPart()));
+                        metadata.set(PDF.PDFAID_PART, Integer.toString(pdfaxmp.getPart()));
                     }
                     if (pdfaxmp.getConformance() != null) {
-                        metadata.set("pdfaid:conformance", pdfaxmp.getConformance());
+                        metadata.set(PDF.PDFAID_CONFORMANCE, pdfaxmp.getConformance());
                         String version = "A-" + pdfaxmp.getPart() + pdfaxmp.getConformance().toLowerCase(Locale.ROOT);
-                        metadata.set("pdfa:PDFVersion", version);
+                        metadata.set(PDF.PDFA_VERSION, version);
                         metadata.add(TikaCoreProperties.FORMAT.getName(),
                                 MEDIA_TYPE.toString() + "; version=\"" + version + "\"");
                     }
@@ -308,7 +316,7 @@ public class PDFParser extends AbstractParser {
         }
         //TODO: Let's try to move this into PDFBox.
         //Attempt to determine Adobe extension level, if present:
-        COSDictionary root = document.getDocumentCatalog().getCOSDictionary();
+        COSDictionary root = document.getDocumentCatalog().getCOSObject();
         COSDictionary extensions = (COSDictionary) root.getDictionaryObject(COSName.getPDFName("Extensions"));
         if (extensions != null) {
             for (COSName extName : extensions.keySet()) {
@@ -320,7 +328,7 @@ public class PDFParser extends AbstractParser {
                         int el = adobeExt.getInt(COSName.getPDFName("ExtensionLevel"));
                         //-1 is sentinel value that something went wrong in getInt
                         if (el != -1) {
-                            metadata.set("pdf:PDFExtensionVersion", baseVersion + " Adobe Extension Level " + el);
+                            metadata.set(PDF.PDF_EXTENSION_VERSION, baseVersion + " Adobe Extension Level " + el);
                             metadata.add(TikaCoreProperties.FORMAT.getName(),
                                     MEDIA_TYPE.toString() + "; version=\"" + baseVersion + " Adobe Extension Level " + el + "\"");
                         }
@@ -513,15 +521,15 @@ public class PDFParser extends AbstractParser {
         return false;
     }
 
-    private void handleXFAOnly(PDDocument pdDocument, ContentHandler handler, Metadata metadata)
+    private void handleXFAOnly(PDDocument pdDocument, ContentHandler handler,
+                               Metadata metadata, ParseContext context)
         throws SAXException, IOException, TikaException {
         XFAExtractor ex = new XFAExtractor();
         XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
         xhtml.startDocument();
-        try {
-            ex.extract(new ByteArrayInputStream(
-                    pdDocument.getDocumentCatalog().getAcroForm().getXFA().getBytes()),
-                xhtml, metadata);
+        try (InputStream is = new ByteArrayInputStream(
+                pdDocument.getDocumentCatalog().getAcroForm().getXFA().getBytes())) {
+            ex.extract(is, xhtml, metadata, context);
         } catch (XMLStreamException e) {
             throw new TikaException("XML error in XFA", e);
         }
@@ -534,25 +542,6 @@ public class PDFParser extends AbstractParser {
 
     public void setPDFParserConfig(PDFParserConfig config) {
         this.defaultConfig = config;
-    }
-
-    /**
-     * @see #setUseNonSequentialParser(boolean)
-     * @deprecated use {@link #getPDFParserConfig()}
-     */
-    public boolean getUseNonSequentialParser() {
-        return defaultConfig.getUseNonSequentialParser();
-    }
-
-    /**
-     * If true, the parser will use the NonSequentialParser.  This may
-     * be faster than the full doc parser.
-     * If false (default), this will use the full doc parser.
-     *
-     * @deprecated use {@link #setPDFParserConfig(PDFParserConfig)}
-     */
-    public void setUseNonSequentialParser(boolean v) {
-        defaultConfig.setUseNonSequentialParser(v);
     }
 
     /**
@@ -635,8 +624,177 @@ public class PDFParser extends AbstractParser {
      *
      * @deprecated use {@link #setPDFParserConfig(PDFParserConfig)}
      */
+    @Field
     public void setSortByPosition(boolean v) {
         defaultConfig.setSortByPosition(v);
     }
 
+    @Field
+    public void setOcrStrategy(String ocrStrategyString) {
+        defaultConfig.setOcrStrategy(ocrStrategyString);
+    }
+
+    @Field
+    public void setOcrImageType(String imageType) {
+        defaultConfig.setOcrImageType(imageType);
+    }
+
+    @Field
+    void setOcrDPI(int dpi) {
+        defaultConfig.setOcrDPI(dpi);
+    }
+
+    @Field
+    void setOcrImageQuality(float imageQuality) {
+        defaultConfig.setOcrImageQuality(imageQuality);
+    }
+
+    @Field
+    void setOcrImageFormatName(String formatName) {
+        defaultConfig.setOcrImageFormatName(formatName);
+    }
+
+    @Field
+    void setOcrImageScale(float imageScale) {
+        defaultConfig.setOcrImageScale(imageScale);
+    }
+
+	@Field
+	void setExtractBookmarksText(boolean extractBookmarksText) {
+		defaultConfig.setExtractBookmarksText(extractBookmarksText);
+	}
+
+    @Field
+    void setExtractInlineImages(boolean extractInlineImages) {
+        defaultConfig.setExtractInlineImages(extractInlineImages);
+    }
+
+    @Field
+    void setCatchIntermediateExceptions(boolean catchIntermediateExceptions) {
+        defaultConfig.setCatchIntermediateIOExceptions(catchIntermediateExceptions);
+    }
+
+    @Field
+    void setExtractAcroFormContent(boolean extractAcroFormContent) {
+        defaultConfig.setExtractAcroFormContent(extractAcroFormContent);
+    }
+
+    @Field
+    void setIfXFAExtractOnlyXFA(boolean ifXFAExtractOnlyXFA) {
+        defaultConfig.setIfXFAExtractOnlyXFA(ifXFAExtractOnlyXFA);
+    }
+
+    @Field
+    void setAllowExtractionForAccessibility(boolean allowExtractionForAccessibility) {
+        defaultConfig.setAccessChecker(new AccessChecker(allowExtractionForAccessibility));
+    }
+
+    @Field
+    void setExtractUniqueInlineImagesOnly(boolean extractUniqueInlineImagesOnly) {
+        defaultConfig.setExtractUniqueInlineImagesOnly(extractUniqueInlineImagesOnly);
+    }
+
+    @Field
+    void setExtractActions(boolean extractActions) {
+        defaultConfig.setExtractActions(extractActions);
+    }
+
+    @Field
+    void setInitializableProblemHander(String name) {
+        if ("ignore".equals(name)) {
+            setInitializableProblemHandler(InitializableProblemHandler.IGNORE);
+        } else if ("info".equalsIgnoreCase(name)) {
+            setInitializableProblemHandler(InitializableProblemHandler.INFO);
+        }   else if ("warn".equalsIgnoreCase(name)) {
+            setInitializableProblemHandler(InitializableProblemHandler.WARN);
+        }   else if ("throw".equalsIgnoreCase(name)) {
+            setInitializableProblemHandler(InitializableProblemHandler.THROW);
+        }
+    }
+
+    public void setInitializableProblemHandler(InitializableProblemHandler initializableProblemHandler) {
+        this.initializableProblemHandler = initializableProblemHandler;
+    }
+    //can return null!
+    private Document loadDOM(PDMetadata pdMetadata, Metadata metadata, ParseContext context) {
+        if (pdMetadata == null) {
+            return null;
+        }
+        InputStream is = null;
+        try {
+            try {
+                is = pdMetadata.exportXMPMetadata();
+            } catch (IOException e) {
+                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata);
+                return null;
+            }
+            DocumentBuilder documentBuilder = context.getDocumentBuilder();
+            documentBuilder.setErrorHandler((ErrorHandler)null);
+            return documentBuilder.parse(is);
+        } catch (IOException|SAXException|TikaException e) {
+            EmbeddedDocumentUtil.recordException(e, metadata);
+        } finally {
+            IOUtils.closeQuietly(is);
+        }
+        return null;
+
+    }
+
+    /**
+     * This is a no-op.  There is no need to initialize multiple fields.
+     * The regular field loading should happen without this.
+     *
+     * @param params params to use for initialization
+     * @throws TikaConfigException
+     */
+    @Override
+    public void initialize(Map<String, Param> params) throws TikaConfigException {
+        //no-op
+    }
+
+    @Override
+    public void checkInitialization(InitializableProblemHandler handler) throws TikaConfigException {
+        //only check for these libraries once!
+        if (HAS_WARNED) {
+            return;
+        }
+        synchronized (LOCK) {
+            if (HAS_WARNED) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            try {
+                Class.forName("com.levigo.jbig2.JBIG2ImageReader");
+            } catch (ClassNotFoundException e) {
+                sb.append("JBIG2ImageReader not loaded. jbig2 files will be ignored\n");
+                sb.append("See https://pdfbox.apache.org/2.0/dependencies.html#jai-image-io\n");
+                sb.append("for optional dependencies.\n");
+            }
+            try {
+                Class.forName("com.github.jaiimageio.impl.plugins.tiff.TIFFImageWriter");
+            } catch (ClassNotFoundException e) {
+                sb.append("TIFFImageWriter not loaded. tiff files will not be processed\n");
+                sb.append("See https://pdfbox.apache.org/2.0/dependencies.html#jai-image-io\n");
+                sb.append("for optional dependencies.\n");
+
+            }
+
+            try {
+                Class.forName("com.github.jaiimageio.jpeg2000.impl.J2KImageReader");
+            } catch (ClassNotFoundException e) {
+                sb.append("J2KImageReader not loaded. JPEG2000 files will not be processed.\n");
+                sb.append("See https://pdfbox.apache.org/2.0/dependencies.html#jai-image-io\n");
+                sb.append("for optional dependencies.\n");
+            }
+
+            if (sb.length() > 0) {
+                InitializableProblemHandler localInitializableProblemHandler =
+                        (initializableProblemHandler == null) ?
+                                handler : initializableProblemHandler;
+                localInitializableProblemHandler.handleInitializableProblem("org.apache.tika.parsers.PDFParser",
+                        sb.toString());
+            }
+            HAS_WARNED = true;
+        }
+    }
 }

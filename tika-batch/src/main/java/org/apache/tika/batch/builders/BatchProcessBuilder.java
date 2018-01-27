@@ -18,8 +18,6 @@ package org.apache.tika.batch.builders;
  */
 
 import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.parsers.ParserConfigurationException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collections;
@@ -33,8 +31,12 @@ import org.apache.tika.batch.FileResource;
 import org.apache.tika.batch.FileResourceCrawler;
 import org.apache.tika.batch.Interrupter;
 import org.apache.tika.batch.StatusReporter;
+import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.IOExceptionWithCause;
+import org.apache.tika.parser.ParseContext;
 import org.apache.tika.util.ClassLoaderUtil;
 import org.apache.tika.util.XMLDOMUtil;
+import org.apache.tika.utils.XMLReaderUtils;
 import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
@@ -65,15 +67,11 @@ public class BatchProcessBuilder {
      */
     public BatchProcess build(InputStream is, Map<String,String> runtimeAttributes) throws IOException {
         Document doc = null;
-        DocumentBuilderFactory fact = DocumentBuilderFactory.newInstance();
-        DocumentBuilder docBuilder = null;
         try {
-            docBuilder = fact.newDocumentBuilder();
+            DocumentBuilder docBuilder = XMLReaderUtils.getDocumentBuilder();
             doc = docBuilder.parse(is);
-        } catch (ParserConfigurationException e) {
-            throw new IOException(e);
-        } catch (SAXException e) {
-            throw new IOException(e);
+        } catch (TikaException|SAXException e) {
+            throw new IOExceptionWithCause(e);
         }
         Node docElement = doc.getDocumentElement();
         return build(docElement, runtimeAttributes);

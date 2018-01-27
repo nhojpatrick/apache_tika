@@ -16,25 +16,27 @@
  */
 package org.apache.tika.metadata;
 
-import static org.apache.tika.utils.DateUtils.MIDDAY;
-import static org.apache.tika.utils.DateUtils.UTC;
 import static org.apache.tika.utils.DateUtils.formatDate;
 
 import java.io.Serializable;
 import java.text.DateFormat;
 import java.text.DateFormatSymbols;
-import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.TimeZone;
 
 import org.apache.tika.metadata.Property.PropertyType;
+import org.apache.tika.utils.DateUtils;
 
 /**
  * A multi-valued metadata container.
@@ -92,24 +94,8 @@ public class Metadata implements CreativeCommons, Geographic, HttpHeaders,
     /**
      * Some parsers will have the date as a ISO-8601 string
      *  already, and will set that into the Metadata object.
-     * So we can return Date objects for these, this is the
-     *  list (in preference order) of the various ISO-8601
-     *  variants that we try when processing a date based
-     *  property.
      */
-    private static final DateFormat[] iso8601InputFormats = new DateFormat[] {
-        // yyyy-mm-ddThh...
-        createDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", UTC),   // UTC/Zulu
-        createDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", null),    // With timezone
-        createDateFormat("yyyy-MM-dd'T'HH:mm:ss", null),     // Without timezone
-        // yyyy-mm-dd hh...
-        createDateFormat("yyyy-MM-dd' 'HH:mm:ss'Z'", UTC),   // UTC/Zulu
-        createDateFormat("yyyy-MM-dd' 'HH:mm:ssZ", null),    // With timezone
-        createDateFormat("yyyy-MM-dd' 'HH:mm:ss", null),     // Without timezone
-        // Date without time, set to Midday UTC
-        createDateFormat("yyyy-MM-dd", MIDDAY),              // Normal date format
-        createDateFormat("yyyy:MM:dd", MIDDAY),              // Image (IPTC/EXIF) format
-    };
+    private static final DateUtils DATE_UTILS = new DateUtils();
 
     private static DateFormat createDateFormat(String format, TimeZone timezone) {
         SimpleDateFormat sdf =
@@ -129,22 +115,7 @@ public class Metadata implements CreativeCommons, Geographic, HttpHeaders,
      * @return parsed date, or <code>null</code> if the date can't be parsed
      */
     private static synchronized Date parseDate(String date) {
-        // Java doesn't like timezones in the form ss+hh:mm
-        // It only likes the hhmm form, without the colon
-        int n = date.length();
-        if (date.charAt(n - 3) == ':'
-            && (date.charAt(n - 6) == '+' || date.charAt(n - 6) == '-')) {
-            date = date.substring(0, n - 3) + date.substring(n - 2);
-        }
-
-        // Try several different ISO-8601 variants
-        for (DateFormat format : iso8601InputFormats) {
-            try {
-                return format.parse(date);
-            } catch (ParseException ignore) {
-            }
-        }
-        return null;
+        return DATE_UTILS.tryToParse(date);
     }
 
     /**
@@ -515,7 +486,20 @@ public class Metadata implements CreativeCommons, Geographic, HttpHeaders,
         return metadata.size();
     }
 
-    public boolean equals(Object o) {
+    public int hashCode() {
+        int h = 0;
+        for (Iterator<Entry<String,String[]>> i = metadata.entrySet().iterator();
+             i.hasNext();) {
+            h += getMetadataEntryHashCode(i.next());
+        }
+        return h;
+    }
+
+    private int getMetadataEntryHashCode(Entry<String, String[]> e) {
+    	return Objects.hashCode(e.getKey()) ^ Arrays.hashCode(e.getValue());
+	}
+
+	public boolean equals(Object o) {
 
         if (o == null) {
             return false;
@@ -554,7 +538,10 @@ public class Metadata implements CreativeCommons, Geographic, HttpHeaders,
         for (int i = 0; i < names.length; i++) {
             String[] values = _getValues(names[i]);
             for (int j = 0; j < values.length; j++) {
-                buf.append(names[i]).append("=").append(values[j]).append(" ");
+            	if (buf.length() > 0) {
+            		buf.append(" ");
+            	}
+                buf.append(names[i]).append("=").append(values[j]);
             }
         }
         return buf.toString();
